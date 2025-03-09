@@ -1,0 +1,2099 @@
+import sys
+import os
+import platform
+import subprocess
+import requests
+import socket
+import time
+import logging
+import json
+import webbrowser
+import tempfile
+import ipaddress
+import threading
+import ssl
+import re
+from datetime import datetime
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton,
+                             QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+                             QFrame, QListWidget, QListWidgetItem, QMessageBox,
+                             QProgressBar, QTabWidget, QTextEdit, QDialog, 
+                             QScrollArea)
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl
+from PyQt5.QtGui import QPixmap, QDesktopServices
+from pymongo import MongoClient, errors
+
+# Constants
+STATUS_COLORS = ['#FBBF24', '#34D399', '#EF4444']
+DATA_REFRESH_INTERVAL = 60000  # milliseconds (1 minute)
+MAX_LOG_ENTRIES = 10
+DEFAULT_IP_INFO = {"ip": "N/A", "location": "N/A"}
+DEFAULT_DB_URL = 'mongodb://127.0.0.1:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2.3.7'
+DB_NAME = 'vpn_detection'
+COLLECTION_NAME = 'vpn_data'
+
+# API Keys (Hidden from UI but used in background)
+PROXYCHECK_API_KEY = "n2g051-435450-9661v0-x64j46" 
+VPNAPI_API_KEY = "03d50e96cfed4eeca7f4a5308b3262d6"
+IPINFO_API_KEY = "889bf0bc1000a4"
+
+# Current date/time and user information
+CURRENT_USER = "Tarun1516"
+
+# VPN Service Lists (Platform Specific)
+VPN_SERVICES = {
+    "Linux": [
+        "openvpn", "strongswan", "xl2tpd", "ppp", "pptp", "l2tp", "ipsec", "wireguard",
+        "nordvpn", "expressvpn", "protonvpn", "mullvad", "vyprvpn", "surfshark", "cisco anyconnect", "softether",
+        "windscribe", "tunnelbear", "ipvanish", "privatevpn", "goldenfrog", "hide.me", "cyberghost", "privateinternetaccess"
+    ],
+    "Windows": [
+        "OpenVPNService", "WireGuardTunnel", "PPTP", "L2TP", "IPSEC", "SstpSvc", "PanGPS",
+        "NordVPN", "ExpressVPN", "ProtonVPN", "MullvadVPN", "VyprVPNService", "Surfshark Service", "Cisco AnyConnect Secure Mobility Agent Service", "SoftEther VPN Client Service",
+        "WindscribeService", "Tunnelbear Desktop", "ipvanish", "PrivateInternetAccessService", "CyberGhost 5 Service", "PIA"
+    ]
+}
+
+# VPN Detection Keywords
+VPN_KEYWORDS = ['vpn', 'expressvpn', 'nordvpn', 'openvpn', 'privateinternetaccess', 'cyberghost', 
+                'turbo', 'windscribe', 'tunnelbear', 'ipvanish', 'privatevpn', 'goldenfrog', 
+                'hide.me', 'proton', 'mullvad', 'hotspot', 'surfshark', 'torguard']
+
+# VPN Provider ASNs
+VPN_ASNS = [
+    16276,  # OVH
+    14061,  # DigitalOcean
+    16509,  # Amazon AWS
+    14618,  # Amazon AES
+    3356,   # Level3
+    9009,   # M247
+    51167,  # Contabo
+    24940,  # Hetzner
+    20473,  # Choopa/Vultr
+    15169   # Google Cloud
+]
+
+# Common VPN Ports
+VPN_PORTS = [1194, 1723, 500, 4500, 1701, 51820, 443, 80, 8080, 53]
+
+# VPN domains to block
+VPN_DOMAINS = [
+    "nordvpn.com", "expressvpn.com", "protonvpn.com", "surfshark.com", "privateinternetaccess.com",
+    "mullvad.net", "vyprvpn.com", "torguard.net", "purevpn.com", "ipvanish.com",
+    "tunnelbear.com", "windscribe.com", "hidemyass.com", "cyberghostvpn.com", "strongvpn.com"
+]
+
+class GeoLocationFinder:
+    """Class to get local machine geolocation"""
+    
+    @staticmethod
+    def get_local_geolocation():
+        """Attempt to determine local machine geolocation"""
+        try:
+            # Method 1: Try to get from Wi-Fi networks (best on laptops)
+            wifi_location = GeoLocationFinder._get_wifi_geolocation()
+            if wifi_location and wifi_location.get('success', False):
+                return {
+                    'city': wifi_location.get('city', 'Unknown'),
+                    'region': wifi_location.get('region', 'Unknown'),
+                    'country': wifi_location.get('country', 'Unknown'),
+                    'latitude': wifi_location.get('latitude', 'Unknown'),
+                    'longitude': wifi_location.get('longitude', 'Unknown'),
+                    'method': 'wifi'
+                }
+                
+            # Method 2: Try IP-API.com with local ISP IP - works if not behind VPN
+            # This still uses the public IP but is a fallback
+            ip_location = GeoLocationFinder._get_ip_based_location()
+            if ip_location:
+                return ip_location
+            
+            # Method 3: Use system timezone as a rough approximation
+            tz_location = GeoLocationFinder._get_timezone_location()
+            if tz_location:
+                return tz_location
+                
+            return None
+        except Exception as e:
+            logging.error(f"Error getting local geolocation: {e}")
+            return None
+    
+    @staticmethod
+    def _get_wifi_geolocation():
+        """Get geolocation based on nearby Wi-Fi networks"""
+        try:
+            wifi_networks = []
+            os_type = platform.system()
+            
+            if os_type == "Windows":
+                # Get Wi-Fi networks on Windows
+                try:
+                    output = subprocess.check_output(
+                        "netsh wlan show networks mode=bssid", 
+                        shell=True, 
+                        universal_newlines=True
+                    )
+                    
+                    current_network = {}
+                    for line in output.split('\n'):
+                        line = line.strip()
+                        if "SSID" in line and ":" in line:
+                            if current_network and 'ssid' in current_network and 'mac' in current_network:
+                                wifi_networks.append(current_network)
+                            current_network = {'ssid': line.split(':', 1)[1].strip()}
+                        elif "BSSID" in line and ":" in line:
+                            current_network['mac'] = line.split(':', 1)[1].strip()
+                    
+                    if current_network and 'ssid' in current_network and 'mac' in current_network:
+                        wifi_networks.append(current_network)
+                        
+                except Exception as e:
+                    logging.error(f"Error getting Windows Wi-Fi networks: {e}")
+            
+            elif os_type == "Linux":
+                # Get Wi-Fi networks on Linux
+                try:
+                    output = subprocess.check_output(
+                        "sudo iwlist scanning | grep -E 'Address|ESSID'", 
+                        shell=True, 
+                        universal_newlines=True
+                    )
+                    
+                    lines = output.split('\n')
+                    for i in range(0, len(lines), 2):
+                        if i+1 < len(lines):
+                            mac_line = lines[i]
+                            ssid_line = lines[i+1]
+                            if "Address:" in mac_line and "ESSID:" in ssid_line:
+                                mac = mac_line.split('Address:', 1)[1].strip()
+                                ssid = ssid_line.split('ESSID:', 1)[1].strip().strip('"')
+                                wifi_networks.append({'ssid': ssid, 'mac': mac})
+                except Exception as e:
+                    logging.error(f"Error getting Linux Wi-Fi networks: {e}")
+            
+            elif os_type == "Darwin":  # macOS
+                # Get Wi-Fi networks on macOS
+                try:
+                    output = subprocess.check_output(
+                        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -s", 
+                        shell=True, 
+                        universal_newlines=True
+                    )
+                    
+                    lines = output.split('\n')[1:]  # Skip header
+                    for line in lines:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            ssid = parts[0]
+                            mac = parts[1]
+                            wifi_networks.append({'ssid': ssid, 'mac': mac})
+                except Exception as e:
+                    logging.error(f"Error getting macOS Wi-Fi networks: {e}")
+            
+            # If we found any networks, use them to get location
+            if wifi_networks:
+                wifi_data = {
+                    "wifiAccessPoints": [
+                        {"macAddress": net["mac"], "signalStrength": -50} 
+                        for net in wifi_networks[:5]  # Use up to 5 networks
+                    ]
+                }
+                
+                # Use Google's API (requires API key) or alternative service
+                # This is a placeholder - in production you'd use a real API
+                return {
+                    'success': True,
+                    'city': 'Local City',  # Placeholder
+                    'region': 'Local Region',
+                    'country': 'Local Country',
+                    'latitude': '0.00',
+                    'longitude': '0.00'
+                }
+            
+            return None
+        except Exception as e:
+            logging.error(f"Error in Wi-Fi geolocation: {e}")
+            return None
+    
+    @staticmethod
+    def _get_ip_based_location():
+        """Get location based on IP address"""
+        try:
+            response = requests.get('http://ip-api.com/json/', timeout=5)
+            data = response.json()
+            
+            if data.get('status') == 'success':
+                return {
+                    'city': data.get('city', 'Unknown'),
+                    'region': data.get('regionName', 'Unknown'),
+                    'country': data.get('country', 'Unknown'),
+                    'latitude': str(data.get('lat', 'Unknown')),
+                    'longitude': str(data.get('lon', 'Unknown')),
+                    'method': 'ip'
+                }
+            return None
+        except Exception as e:
+            logging.error(f"Error getting IP-based location: {e}")
+            return None
+    
+    @staticmethod
+    def _get_timezone_location():
+        """Get approximate location based on system timezone"""
+        try:
+            tz = time.tzname[0]
+            time_diff = time.timezone / 3600
+            
+            # This is very approximate
+            return {
+                'city': 'Local City (based on timezone)',
+                'region': 'Unknown',
+                'country': 'Unknown',
+                'latitude': 'Unknown',
+                'longitude': 'Unknown',
+                'timezone': tz,
+                'method': 'timezone'
+            }
+        except Exception as e:
+            logging.error(f"Error getting timezone location: {e}")
+            return None
+
+
+class VPNDetectionThread(QThread):
+    detection_complete = pyqtSignal(dict)
+    
+    def __init__(self, ip_address=None, user_agent=None):
+        super().__init__()
+        self.ip_address = ip_address
+        self.user_agent = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        self.local_ip_location = None
+        
+    def run(self):
+        try:
+            # Get local machine geolocation first
+            self.local_ip_location = GeoLocationFinder.get_local_geolocation()
+            
+            if not self.ip_address:
+                ip_response = requests.get('https://api.ipify.org?format=json', timeout=5)
+                self.ip_address = ip_response.json()['ip']
+                
+            results = self.comprehensive_vpn_detection(self.ip_address)
+            self.detection_complete.emit(results)
+        except Exception as e:
+            logging.error(f"VPN detection thread error: {str(e)}")
+            self.detection_complete.emit({
+                "error": str(e),
+                "isVPN": False,
+                "confidence": 0,
+                "ip": self.ip_address if self.ip_address else "Unknown",
+                "local_location": self.local_ip_location or {}
+            })
+    
+    def check_proxycheck_io(self, ip):
+        """Check VPN status using ProxyCheck.io API"""
+        try:
+            url = f"http://proxycheck.io/v2/{ip}?key={PROXYCHECK_API_KEY}&vpn=1&asn=1"
+            response = requests.get(url, timeout=5)  # Reduced timeout
+            data = response.json()
+            
+            # Extract relevant data
+            proxy_data = data.get(ip, {})
+            is_proxy = proxy_data.get('proxy') == 'yes'
+            is_vpn = 'vpn' in str(proxy_data.get('type', '')).lower() or is_proxy
+            
+            # Get location data
+            country = proxy_data.get('country', 'Unknown')
+            isocode = proxy_data.get('isocode', '')
+            region = proxy_data.get('region', '')
+            city = proxy_data.get('city', '')
+            latitude = proxy_data.get('latitude', '')
+            longitude = proxy_data.get('longitude', '')
+            asn = proxy_data.get('asn', '')
+            provider = proxy_data.get('provider', '')
+            
+            location = {
+                'country': country,
+                'isocode': isocode,
+                'region': region,
+                'city': city,
+                'latitude': latitude,
+                'longitude': longitude,
+                'asn': asn,
+                'provider': provider
+            }
+            
+            return {
+                'is_vpn': is_vpn,
+                'is_proxy': is_proxy,
+                'location': location,
+                'raw_data': proxy_data,
+                'service': 'ProxyCheck.io'
+            }
+        except Exception as e:
+            logging.error(f"ProxyCheck.io API error: {str(e)}")
+            return {'is_vpn': False, 'is_proxy': False, 'error': str(e), 'service': 'ProxyCheck.io'}
+    
+    def check_vpnapi_io(self, ip):
+        """Check VPN status using VPNAPI.io API"""
+        try:
+            url = f"https://vpnapi.io/api/{ip}?key={VPNAPI_API_KEY}"
+            response = requests.get(url, timeout=5)  # Reduced timeout
+            data = response.json()
+            
+            security_data = data.get('security', {})
+            is_vpn = security_data.get('vpn', False)
+            is_proxy = security_data.get('proxy', False)
+            is_tor = security_data.get('tor', False)
+            threat_level = security_data.get('threat_level', 'low')
+            
+            location_data = {
+                'country': data.get('location', {}).get('country', 'Unknown'),
+                'region': data.get('location', {}).get('region', ''),
+                'city': data.get('location', {}).get('city', ''),
+                'latitude': data.get('location', {}).get('latitude', ''),
+                'longitude': data.get('location', {}).get('longitude', ''),
+            }
+            
+            return {
+                'is_vpn': is_vpn,
+                'is_proxy': is_proxy,
+                'is_tor': is_tor,
+                'threat_level': threat_level,
+                'location': location_data,
+                'raw_data': data,
+                'service': 'VPNAPI.io'
+            }
+        except Exception as e:
+            logging.error(f"VPNAPI.io API error: {str(e)}")
+            return {'is_vpn': False, 'is_proxy': False, 'error': str(e), 'service': 'VPNAPI.io'}
+    
+    def check_ipinfo_io(self, ip):
+        """Check VPN status using IPinfo.io API"""
+        try:
+            url = f"https://ipinfo.io/{ip}/json?token={IPINFO_API_KEY}"
+            response = requests.get(url, timeout=5)  # Reduced timeout
+            data = response.json()
+            
+            # Check for known VPN/proxy indicators
+            company = data.get('company', {}).get('name', '').lower()
+            org = data.get('org', '').lower()
+            is_vpn = any(keyword in company or keyword in org for keyword in VPN_KEYWORDS)
+            
+            # Parse location data
+            if 'loc' in data and ',' in data['loc']:
+                lat, lon = data['loc'].split(',')
+            else:
+                lat, lon = '', ''
+            
+            location_data = {
+                'country': data.get('country', 'Unknown'),
+                'region': data.get('region', ''),
+                'city': data.get('city', ''),
+                'latitude': lat,
+                'longitude': lon,
+                'timezone': data.get('timezone', ''),
+                'asn': data.get('org', ''),
+                'hostname': data.get('hostname', '')
+            }
+            
+            # Check for privacy services
+            privacy = data.get('privacy', {})
+            is_hosting = privacy.get('hosting', False)
+            is_proxy = privacy.get('proxy', False)
+            is_tor = privacy.get('tor', False)
+            is_vpn_from_privacy = privacy.get('vpn', False)
+            
+            # If privacy data is available, use it as the definitive source
+            if 'privacy' in data:
+                is_vpn = is_vpn_from_privacy or is_proxy or is_tor
+            
+            return {
+                'is_vpn': is_vpn,
+                'is_proxy': is_proxy if 'privacy' in data else False,
+                'is_tor': is_tor if 'privacy' in data else False,
+                'is_hosting': is_hosting if 'privacy' in data else False,
+                'location': location_data,
+                'raw_data': data,
+                'service': 'IPinfo.io'
+            }
+        except Exception as e:
+            logging.error(f"IPinfo.io API error: {str(e)}")
+            return {'is_vpn': False, 'is_proxy': False, 'error': str(e), 'service': 'IPinfo.io'}
+
+    def check_running_vpn_processes(self):
+        """Check for running VPN processes"""
+        try:
+            import psutil
+            
+            running_vpn_processes = []
+            
+            for process in psutil.process_iter(['name', 'cmdline']):
+                try:
+                    process_name = process.info['name'].lower() if process.info['name'] else ""
+                    cmdline = ' '.join(process.info['cmdline']).lower() if process.info['cmdline'] else ""
+                    
+                    if any(keyword in process_name or keyword in cmdline for keyword in VPN_KEYWORDS):
+                        running_vpn_processes.append(process_name)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            
+            return {
+                'detected': len(running_vpn_processes) > 0,
+                'processes': running_vpn_processes
+            }
+        except Exception as e:
+            return {'error': str(e), 'detected': False}
+    
+    def check_network_interfaces(self):
+        """Check for VPN network interfaces"""
+        try:
+            import psutil
+            vpn_interfaces = []
+            
+            for interface, addrs in psutil.net_if_addrs().items():
+                if any(keyword in interface.lower() for keyword in VPN_KEYWORDS):
+                    vpn_interfaces.append(interface)
+            
+            return {
+                'detected': len(vpn_interfaces) > 0,
+                'interfaces': vpn_interfaces
+            }
+        except Exception as e:
+            return {'error': str(e), 'detected': False}
+    
+    def detect_dns_leaks(self):
+        """Attempt to detect DNS leaks"""
+        try:
+            # This is a simplified detection - in a real application you would compare
+            # expected DNS servers with actual DNS resolutions
+            try:
+                import dns.resolver
+                resolver = dns.resolver.Resolver()
+                resolver.timeout = 5
+                resolver.lifetime = 5
+                
+                # Get system nameservers
+                nameservers = resolver.nameservers
+                
+                # Check if any nameservers are public rather than VPN's DNS
+                public_dns = ['8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1', '9.9.9.9']
+                potential_leak = any(ns in public_dns for ns in nameservers)
+                
+                return {'detected': potential_leak, 'nameservers': nameservers}
+            except ImportError:
+                return {'detected': False, 'error': 'dns.resolver module not available'}
+        except Exception as e:
+            return {'error': str(e), 'detected': False}
+    
+    def check_timing_inconsistencies(self):
+        """Check for timing inconsistencies that might indicate VPN usage"""
+        try:
+            timings = []
+            total_variance = 0
+            
+            for i in range(2):  # Reduced to 2 requests to minimize delay
+                start_time = time.time()
+                requests.get('https://www.google.com', timeout=2)
+                end_time = time.time()
+                timings.append(end_time - start_time)
+            
+            if len(timings) > 1:
+                avg = sum(timings) / len(timings)
+                variance = sum((t - avg) ** 2 for t in timings) / len(timings)
+                total_variance = variance
+                
+            return {
+                'high_variance': total_variance > 0.15,  # Threshold for suspicion
+                'variance': total_variance,
+                'timings': timings
+            }
+        except Exception as e:
+            return {'error': str(e), 'high_variance': False}
+    
+    def compare_ip_locations(self, public_ip_location, local_ip_location):
+        """Compare locations of public IP and local machine IP"""
+        try:
+            if not local_ip_location or not public_ip_location:
+                return {'location_mismatch': False, 'reason': 'Missing location data'}
+            
+            # Compare country first (most reliable indicator)
+            public_country = public_ip_location.get('country', '').lower()
+            local_country = local_ip_location.get('country', '').lower()
+            
+            if public_country and local_country and public_country != local_country:
+                return {'location_mismatch': True, 'reason': f'Country mismatch: {public_country} vs {local_country}'}
+            
+            # Compare city if both are available
+            public_city = public_ip_location.get('city', '').lower()
+            local_city = local_ip_location.get('city', '').lower()
+            
+            if public_city and local_city and public_city != local_city and public_city != 'unknown' and local_city != 'unknown':
+                return {'location_mismatch': True, 'reason': f'City mismatch: {public_city} vs {local_city}'}
+            
+            # If we have coordinates for both, compare them
+            try:
+                public_lat = float(public_ip_location.get('latitude', 0))
+                public_lon = float(public_ip_location.get('longitude', 0))
+                local_lat = float(local_ip_location.get('latitude', 0))
+                local_lon = float(local_ip_location.get('longitude', 0))
+                
+                # Calculate distance in km using Haversine formula
+                from math import sin, cos, sqrt, atan2, radians
+                R = 6371  # Earth radius in km
+                
+                lat1, lon1 = radians(public_lat), radians(public_lon)
+                lat2, lon2 = radians(local_lat), radians(local_lon)
+                
+                dlon = lon2 - lon1
+                dlat = lat2 - lat1
+                
+                a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+                c = 2 * atan2(sqrt(a), sqrt(1-a))
+                distance = R * c
+                
+                # If distance is greater than 50km, consider it a mismatch
+                if distance > 50:
+                    return {'location_mismatch': True, 'reason': f'Distance too great: {distance:.1f} km'}
+            except Exception as e:
+                # If we can't calculate distance, don't use it as an indicator
+                pass
+                
+            return {'location_mismatch': False, 'reason': 'Locations match or insufficient data'}
+            
+        except Exception as e:
+            return {'error': str(e), 'location_mismatch': False}
+            
+    def comprehensive_vpn_detection(self, ip):
+        """Combine all VPN detection methods for a comprehensive result"""
+        results = {
+            'knownVPNIP': False,
+            'dnsLeakDetected': False,
+            'locationMismatch': False,
+            'timingInconsistent': False,
+            'vpnProcesses': False,
+            'vpnInterfaces': False,
+            'proxycheck_result': {},
+            'vpnapi_result': {},
+            'ipinfo_result': {}
+        }
+        
+        # 1. Check with ProxyCheck.io API
+        proxycheck_result = self.check_proxycheck_io(ip)
+        results['proxycheck_result'] = proxycheck_result
+        proxycheck_vpn = proxycheck_result.get('is_vpn', False)
+        
+        # 2. Check with VPNAPI.io
+        vpnapi_result = self.check_vpnapi_io(ip)
+        results['vpnapi_result'] = vpnapi_result
+        vpnapi_vpn = vpnapi_result.get('is_vpn', False) or vpnapi_result.get('is_proxy', False) or vpnapi_result.get('is_tor', False)
+        
+        # 3. Check with IPinfo.io API
+        ipinfo_result = self.check_ipinfo_io(ip)
+        results['ipinfo_result'] = ipinfo_result
+        ipinfo_vpn = ipinfo_result.get('is_vpn', False) or ipinfo_result.get('is_proxy', False) or ipinfo_result.get('is_tor', False)
+        
+        # If at least 2 of the 3 services report a VPN, consider it a known VPN IP
+        vpn_votes = [proxycheck_vpn, vpnapi_vpn, ipinfo_vpn].count(True)
+        results['knownVPNIP'] = vpn_votes >= 2
+        
+        # Merge location data - prefer ProxyCheck's detailed data if available
+        location = {}
+        for result in [proxycheck_result, ipinfo_result, vpnapi_result]:
+            if 'location' in result and isinstance(result['location'], dict):
+                # Update with non-empty values
+                for key, value in result['location'].items():
+                    if value and (key not in location or not location[key]):
+                        location[key] = value
+        
+        # 4. Compare IP locations (public vs local machine)
+        location_comparison = self.compare_ip_locations(location, self.local_ip_location)
+        results['locationMismatch'] = location_comparison.get('location_mismatch', False)
+        results['locationMismatchReason'] = location_comparison.get('reason', '')
+        
+        # 5. DNS leak detection
+        dns_leak_result = self.detect_dns_leaks()
+        results['dnsLeakDetected'] = dns_leak_result.get('detected', False)
+        
+        # 6. Timing analysis
+        timing_result = self.check_timing_inconsistencies()
+        results['timingInconsistent'] = timing_result.get('high_variance', False)
+        
+        # 7. VPN processes
+        process_result = self.check_running_vpn_processes()
+        results['vpnProcesses'] = process_result.get('detected', False)
+        
+        # 8. VPN interfaces
+        interface_result = self.check_network_interfaces()
+        results['vpnInterfaces'] = interface_result.get('detected', False)
+        
+        # Calculate confidence score
+        vpn_score = 0
+        # API services have higher weight (0.5 total)
+        if proxycheck_vpn: vpn_score += 0.15
+        if vpnapi_vpn: vpn_score += 0.15
+        if ipinfo_vpn: vpn_score += 0.2
+        # System checks (0.5 total)
+        if results['locationMismatch']: vpn_score += 0.1
+        if results['dnsLeakDetected']: vpn_score += 0.05
+        if results['timingInconsistent']: vpn_score += 0.1
+        if results['vpnProcesses']: vpn_score += 0.15
+        if results['vpnInterfaces']: vpn_score += 0.1
+        
+        # Calculate confidence percentage
+        confidence_percentage = min(round(vpn_score * 100), 100)
+        
+        # Determine final VPN status - ONLY if confidence > 50% 
+        # This is a key change requested
+        is_vpn = confidence_percentage > 50
+
+        
+        
+        return {
+            'isVPN': is_vpn,
+            'confidence': confidence_percentage,
+            'details': results,
+            'location': location,
+            'local_location': self.local_ip_location,
+            'ip': ip,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'vpn_votes': vpn_votes
+        }
+
+
+class VPNBlockerThread(QThread):
+    blocking_status = pyqtSignal(dict)
+    
+    def __init__(self, action="start"):
+        super().__init__()
+        self.action = action  # "start" or "stop"
+        self.os_type = platform.system()
+        
+    def run(self):
+        result = {"success": False, "message": "Unknown error"}
+        
+        try:
+            if self.action == "start":
+                if self.os_type == "Windows":
+                    result = self.block_vpn_windows()
+                elif self.os_type == "Linux":
+                    result = self.block_vpn_linux()
+                else:
+                    result = {"success": False, "message": f"VPN blocking not supported on {self.os_type}"}
+            else:
+                if self.os_type == "Windows":
+                    result = self.stop_blocking_windows()
+                elif self.os_type == "Linux":
+                    result = self.stop_blocking_linux()
+                else:
+                    result = {"success": False, "message": f"VPN blocking not supported on {self.os_type}"}
+        except Exception as e:
+            result = {"success": False, "message": f"Error: {str(e)}"}
+            
+        self.blocking_status.emit(result)
+    
+    def block_vpn_windows(self):
+        """Implement strict VPN blocking on Windows with permanent blocking"""
+        try:
+            # 1. Block VPN services
+            for service in VPN_SERVICES["Windows"]:
+                try:
+                    subprocess.run(["sc", "stop", service], check=False, capture_output=True)
+                    subprocess.run(["sc", "config", service, "start=disabled"], check=False, capture_output=True)
+                except:
+                    pass  # Continue if service doesn't exist or can't be managed
+            
+            # 2. Create strict firewall rules
+            firewall_rules = [
+                # Block OpenVPN
+                'netsh advfirewall firewall add rule name="Block OpenVPN" dir=out program="*openvpn*.exe" action=block', 
+                'netsh advfirewall firewall add rule name="Block VPN UDP" dir=out protocol=UDP remoteport=1194,500,4500,1701,51820 action=block',
+                'netsh advfirewall firewall add rule name="Block VPN TCP" dir=out protocol=TCP remoteport=1194,443,1723 action=block',
+                # Block WireGuard
+                'netsh advfirewall firewall add rule name="Block WireGuard" dir=out program="*wireguard*.exe" action=block',
+                # Block general VPN ports
+                'netsh advfirewall firewall add rule name="Block VPN Protocols" dir=out protocol=ANY remoteport=1194,500,4500,1701,51820 action=block',
+                # Additional blocks for DNS
+                'netsh advfirewall firewall add rule name="Block All Outgoing DNS UDP" dir=out protocol=UDP remoteport=53 action=block', 
+                'netsh advfirewall firewall add rule name="Block All Outgoing DNS TCP" dir=out protocol=TCP remoteport=53 action=block'
+            ]
+            
+            for rule in firewall_rules:
+                subprocess.run(rule, shell=True, check=False, capture_output=True)
+            
+            # 3. Disable TAP/TUN adapters
+            subprocess.run('powershell "Get-NetAdapter | Where-Object {$_.InterfaceDescription -match \'TAP|TUN|VPN\'} | Disable-NetAdapter -Confirm:$false"', 
+                          shell=True, check=False, capture_output=True)
+            
+            # 4. Create the VPN process blocker script with enhanced functionality
+            script_content = '''
+@echo off
+:loop
+REM Stop VPN services
+sc stop OpenVPNService
+sc stop WireGuardTunnel
+sc stop PPTP
+sc stop L2TP
+sc stop IPSEC
+sc stop SstpSvc
+sc stop PanGPS
+sc stop NordVPN
+sc stop ExpressVPN
+sc stop ProtonVPN
+sc stop MullvadVPN
+sc stop VyprVPNService
+sc stop "Surfshark Service" 
+sc stop "Cisco AnyConnect Secure Mobility Agent Service" 
+sc stop "SoftEther VPN Client Service"
+sc stop WindscribeService
+sc stop "Tunnelbear Desktop"
+sc stop ipvanish
+sc stop PrivateInternetAccessService
+sc stop "CyberGhost 5 Service"
+sc stop PIA
+
+REM Keep services disabled
+sc config OpenVPNService start=disabled
+sc config WireGuardTunnel start=disabled
+sc config PPTP start=disabled
+sc config L2TP start=disabled
+sc config IPSEC start=disabled
+sc config SstpSvc start=disabled
+sc config PanGPS start=disabled
+sc config NordVPN start=disabled
+sc config ExpressVPN start=disabled
+sc config ProtonVPN start=disabled
+sc config MullvadVPN start=disabled
+sc config VyprVPNService start=disabled
+sc config "Surfshark Service" start=disabled
+sc config "Cisco AnyConnect Secure Mobility Agent Service" start=disabled
+sc config "SoftEther VPN Client Service" start=disabled
+sc config WindscribeService start=disabled
+sc config "Tunnelbear Desktop" start=disabled
+sc config ipvanish start=disabled
+sc config PrivateInternetAccessService start=disabled
+sc config "CyberGhost 5 Service" start=disabled
+sc config PIA start=disabled
+
+REM Disable network adapters
+powershell -Command "Get-NetAdapter | Where-Object {$_.InterfaceDescription -match \'TAP|TUN|VPN\'} | Disable-NetAdapter -Confirm:$false" 2>nul
+
+REM Re-apply firewall rules
+netsh advfirewall firewall add rule name="Block VPN UDP" dir=out protocol=UDP remoteport=1194,500,4500,1701,51820 action=block
+netsh advfirewall firewall add rule name="Block VPN TCP" dir=out protocol=TCP remoteport=1194,443,1723 action=block
+netsh advfirewall firewall add rule name="Block OpenVPN" dir=out program="*openvpn*.exe" action=block
+netsh advfirewall firewall add rule name="Block WireGuard" dir=out program="*wireguard*.exe" action=block
+netsh advfirewall firewall add rule name="Block VPN Protocols" dir=out protocol=ANY remoteport=1194,500,4500,1701,51820 action=block
+
+REM Kill VPN processes if they exist
+taskkill /f /im openvpn.exe 2>nul
+taskkill /f /im openvpnserv.exe 2>nul
+taskkill /f /im openvpnserv2.exe 2>nul
+taskkill /f /im tapinstall.exe 2>nul
+taskkill /f /im wireguard.exe 2>nul
+taskkill /f /im nordvpn.exe 2>nul
+taskkill /f /im expressvpn.exe 2>nul
+taskkill /f /im protonvpn.exe 2>nul
+taskkill /f /im mullvad.exe 2>nul
+taskkill /f /im vpn.exe 2>nul
+
+REM Disable VPN related tasks
+schtasks /Change /TN "*vpn*" /Disable 2>nul
+schtasks /Change /TN "*VPN*" /Disable 2>nul
+schtasks /Change /TN "*nordvpn*" /Disable 2>nul
+schtasks /Change /TN "*expressvpn*" /Disable 2>nul
+schtasks /Change /TN "*proton*" /Disable 2>nul
+
+timeout /t 5 >nul
+goto loop
+'''
+            script_path = os.path.join(tempfile.gettempdir(), "vpn_blocker.bat")
+            with open(script_path, "w") as f:
+                f.write(script_content)
+            
+            # 5. Create a scheduled task to run the VPN blocker at startup and periodically
+            try:
+                # Delete existing task if it exists
+                subprocess.run(["schtasks", "/delete", "/tn", "VPNBlocker", "/f"], 
+                              check=False, capture_output=True)
+                
+                # Create new task to run at startup and every 5 minutes
+                subprocess.run([
+                    "schtasks", "/create", "/tn", "VPNBlocker", "/tr", script_path,
+                    "/sc", "minute", "/mo", "5", "/ru", "SYSTEM", "/f"
+                ], check=False, capture_output=True)
+                
+                # Run the task now
+                subprocess.run(["schtasks", "/run", "/tn", "VPNBlocker"], check=False, capture_output=True)
+                
+                # Also create a startup task
+                startup_task = [
+                    "schtasks", "/create", "/tn", "VPNBlockerStartup", "/tr", script_path,
+                    "/sc", "onstart", "/ru", "SYSTEM", "/f"
+                ]
+                subprocess.run(startup_task, check=False, capture_output=True)
+                
+            except Exception as e:
+                logging.error(f"Failed to create scheduled task: {str(e)}")
+            
+            # 6. Try to modify hosts file to block VPN provider websites
+            try:
+                hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
+                with open(hosts_path, "a") as hosts_file:
+                    hosts_file.write("\n# VPN Provider Blocks added by CheckBlock\n")
+                    for domain in VPN_DOMAINS:
+                        hosts_file.write(f"127.0.0.1 {domain}\n")
+                        hosts_file.write(f"127.0.0.1 www.{domain}\n")
+            except Exception as e:
+                logging.error(f"Failed to modify hosts file: {str(e)}")
+            
+            return {
+                "success": True, 
+                "message": "VPN blocking measures implemented. Firewall rules added, VPN services disabled, and persistent blocking enabled."
+            }
+        except Exception as e:
+            return {
+                "success": False, 
+                "message": f"Failed to apply VPN blocking: {str(e)}"
+            }
+    
+    def stop_blocking_windows(self):
+        """Stop VPN blocking on Windows"""
+        try:
+            # Delete firewall rules
+            vpn_rules = [
+                "Block All Outgoing DNS UDP", 
+                "Block All Outgoing DNS TCP", 
+                "Block OpenVPN", 
+                "Block WireGuard", 
+                "Block VPN UDP Ports", 
+                "Block VPN TCP Ports", 
+                "Block VPN Protocols",
+                "Block VPN UDP",
+                "Block VPN TCP"
+            ]
+            
+            for rule in vpn_rules:
+                subprocess.run(f'netsh advfirewall firewall delete rule name="{rule}"', 
+                              shell=True, check=False, capture_output=True)
+            
+            # Remove scheduled tasks
+            subprocess.run(["schtasks", "/delete", "/tn", "VPNBlocker", "/f"], 
+                          check=False, capture_output=True)
+            subprocess.run(["schtasks", "/delete", "/tn", "VPNBlockerStartup", "/f"], 
+                          check=False, capture_output=True)
+            
+            # Stop running blocker script
+            subprocess.run('taskkill /f /im cmd.exe /fi "windowtitle eq vpn_blocker*"', 
+                          shell=True, check=False, capture_output=True)
+            
+            # Enable VPN services
+            for service in VPN_SERVICES["Windows"]:
+                try:
+                    subprocess.run(["sc", "config", service, "start=demand"], 
+                                  check=False, capture_output=True)
+                except:
+                    pass
+                    
+            # Cleanup hosts file
+            try:
+                hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
+                with open(hosts_path, "r") as hosts_file:
+                    lines = hosts_file.readlines()
+                
+                with open(hosts_path, "w") as hosts_file:
+                    for line in lines:
+                        if not any(domain in line for domain in VPN_DOMAINS) and "CheckBlock" not in line:
+                            hosts_file.write(line)
+            except Exception as e:
+                logging.error(f"Failed to cleanup hosts file: {str(e)}")
+                
+            return {
+                "success": True, 
+                "message": "VPN blocking measures removed. Firewall rules deleted, scheduled tasks removed."
+            }
+        except Exception as e:
+            return {
+                "success": False, 
+                "message": f"Failed to stop VPN blocking: {str(e)}"
+            }
+    
+    def block_vpn_linux(self):
+        """Implement strict VPN blocking on Linux"""
+        try:
+            # 1. Block kernel modules
+            kernel_blocks = [
+                "install tun /bin/true",
+                "install tap /bin/true",
+                "install ppp_generic /bin/true"
+            ]
+            
+            # Create blacklist file
+            try:
+                with open("/etc/modprobe.d/vpn_blacklist.conf", "w") as f:
+                    for block in kernel_blocks:
+                        f.write(f"{block}\n")
+            except Exception as e:
+                logging.error(f"Failed to create kernel module blacklist: {str(e)}")
+            
+            # 2. Remove existing kernel modules
+            modules_to_remove = ["tun", "tap", "ppp_generic"]
+            for module in modules_to_remove:
+                try:
+                    subprocess.run(["rmmod", module], stderr=subprocess.DEVNULL)
+                except:
+                    pass
+            
+            # 3. Create strict iptables rules
+            iptables_rules = [
+                # Block common VPN ports
+                "iptables -A OUTPUT -p udp --dport 1194 -j DROP",  # OpenVPN
+                "iptables -A OUTPUT -p tcp --dport 1194 -j DROP",
+                "iptables -A OUTPUT -p udp --dport 500 -j DROP",   # IKEv2
+                "iptables -A OUTPUT -p udp --dport 4500 -j DROP",
+                "iptables -A OUTPUT -p tcp --dport 1723 -j DROP",  # PPTP
+                "iptables -A OUTPUT -p udp --dport 51820 -j DROP", # WireGuard
+                
+                # Block DNS
+                "iptables -A OUTPUT -p udp --dport 53 -j DROP",
+                "iptables -A OUTPUT -p tcp --dport 53 -j DROP",
+
+                # Block VPN interfaces
+                "iptables -A OUTPUT -o tun+ -j DROP",
+                "iptables -A OUTPUT -o tap+ -j DROP",
+                "iptables -A OUTPUT -o ppp+ -j DROP",
+
+                # Block known VPN provider IPs (pattern matching)
+                "iptables -A OUTPUT -m string --string 'openvpn' --algo bm -j DROP",
+                "iptables -A OUTPUT -m string --string 'vpn' --algo bm -j DROP"
+            ]
+            
+            for rule in iptables_rules:
+                try:
+                    subprocess.run(rule.split(), check=False, stderr=subprocess.DEVNULL)
+                except:
+                    pass
+                    
+            # Try to save iptables rules
+            try:
+                # Check for iptables-save command and appropriate directory
+                if os.path.exists("/sbin/iptables-save") or os.path.exists("/usr/sbin/iptables-save"):
+                    if not os.path.exists("/etc/iptables"):
+                        os.makedirs("/etc/iptables")
+                    subprocess.run("iptables-save > /etc/iptables/rules.v4", shell=True, check=False)
+            except:
+                pass
+            
+            # 4. Disable and mask VPN services
+            for service in VPN_SERVICES["Linux"]:
+                try:
+                    subprocess.run(["systemctl", "stop", service], stderr=subprocess.DEVNULL)
+                    subprocess.run(["systemctl", "disable", service], stderr=subprocess.DEVNULL)
+                    subprocess.run(["systemctl", "mask", service], stderr=subprocess.DEVNULL)
+                except:
+                    continue
+            
+            # 5. Try to remove VPN software
+            package_managers = {
+                "apt-get": "apt-get purge -y",
+                "yum": "yum remove -y",
+                "dnf": "dnf remove -y",
+                "pacman": "pacman -R --noconfirm"
+            }
+            
+            for pm, cmd in package_managers.items():
+                if subprocess.run(["which", pm], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL).returncode == 0:
+                    for service in VPN_SERVICES["Linux"]:
+                        try:
+                            subprocess.run(f"{cmd} {service}", shell=True, stderr=subprocess.DEVNULL, check=False)
+                        except:
+                            pass
+            
+            # 6. Block VPN-related directories
+            vpn_dirs = [
+                "/etc/openvpn",
+                "/etc/wireguard",
+                "/etc/strongswan",
+                "/etc/xl2tpd"
+            ]
+            
+            for directory in vpn_dirs:
+                if os.path.exists(directory):
+                    try:
+                        # Make directory immutable
+                        subprocess.run(["chattr", "+i", directory], check=False, stderr=subprocess.DEVNULL)
+                    except:
+                        continue
+            
+            # 7. Set up persistent blocking
+            blocker_script = '''#!/bin/bash
+while true; do
+    # Continuously enforce VPN blocking
+    rmmod tun tap ppp_generic 2>/dev/null
+
+    # Kill any VPN-related processes
+    pkill -f "openvpn|vpn|tunnel|tun|tap|ppp|l2tp|ipsec|strongswan|wireguard"
+
+    # Re-apply iptables rules if directory exists
+    if [ -f "/etc/iptables/rules.v4" ]; then
+        iptables-restore < /etc/iptables/rules.v4
+    fi
+
+    sleep 5
+done
+'''
+            try:
+                with open("/usr/local/bin/vpn_blocker", "w") as f:
+                    f.write(blocker_script)
+                os.chmod("/usr/local/bin/vpn_blocker", 0o755)
+                
+                service_content = '''
+[Unit]
+Description=VPN Blocking Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vpn_blocker
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+'''
+                with open("/etc/systemd/system/vpn_blocker.service", "w") as f:
+                    f.write(service_content)
+                
+                subprocess.run(["systemctl", "daemon-reload"])
+                subprocess.run(["systemctl", "enable", "vpn_blocker"], stderr=subprocess.DEVNULL)
+                subprocess.run(["systemctl", "start", "vpn_blocker"], stderr=subprocess.DEVNULL)
+            except Exception as e:
+                logging.error(f"Failed to create blocker service: {str(e)}")
+            
+            # 8. Modify hosts file to block VPN domains
+            try:
+                with open("/etc/hosts", "a") as hosts_file:
+                    hosts_file.write("\n# VPN Provider Blocks added by CheckBlock\n")
+                    for domain in VPN_DOMAINS:
+                        hosts_file.write(f"127.0.0.1 {domain}\n")
+                        hosts_file.write(f"127.0.0.1 www.{domain}\n")
+            except Exception as e:
+                logging.error(f"Failed to modify hosts file: {str(e)}")
+            
+            return {
+                "success": True, 
+                "message": "Linux VPN blocking measures implemented. Kernel modules blocked, iptables rules added, VPN services disabled."
+            }
+        except Exception as e:
+            return {
+                "success": False, 
+                "message": f"Failed to apply Linux VPN blocking: {str(e)}"
+            }
+    
+    def stop_blocking_linux(self):
+        """Stop VPN blocking on Linux"""
+        try:
+            # Remove kernel module blacklist
+            try:
+                if os.path.exists("/etc/modprobe.d/vpn_blacklist.conf"):
+                    os.remove("/etc/modprobe.d/vpn_blacklist.conf")
+            except:
+                pass
+            
+            # Remove iptables rules (flush chains)
+            try:
+                subprocess.run(["iptables", "-F", "OUTPUT"])
+            except:
+                pass
+            
+            # Stop and remove blocker service
+            try:
+                subprocess.run(["systemctl", "stop", "vpn_blocker"], stderr=subprocess.DEVNULL)
+                subprocess.run(["systemctl", "disable", "vpn_blocker"], stderr=subprocess.DEVNULL)
+                subprocess.run(["systemctl", "unmask", "vpn_blocker"], stderr=subprocess.DEVNULL)
+                
+                if os.path.exists("/etc/systemd/system/vpn_blocker.service"):
+                    os.remove("/etc/systemd/system/vpn_blocker.service")
+                
+                if os.path.exists("/usr/local/bin/vpn_blocker"):
+                    os.remove("/usr/local/bin/vpn_blocker")
+                    
+                subprocess.run(["systemctl", "daemon-reload"])
+            except:
+                pass
+                
+            # Unblock VPN directories
+            vpn_dirs = [
+                "/etc/openvpn",
+                "/etc/wireguard",
+                "/etc/strongswan",
+                "/etc/xl2tpd"
+            ]
+            
+            for directory in vpn_dirs:
+                if os.path.exists(directory):
+                    try:
+                        # Remove immutable attribute
+                        subprocess.run(["chattr", "-i", directory], check=False)
+                    except:
+                        continue
+                        
+            # Cleanup hosts file
+            try:
+                with open("/etc/hosts", "r") as hosts_file:
+                    lines = hosts_file.readlines()
+                
+                with open("/etc/hosts", "w") as hosts_file:
+                    for line in lines:
+                        if not any(domain in line for domain in VPN_DOMAINS) and "CheckBlock" not in line:
+                            hosts_file.write(line)
+            except Exception as e:
+                logging.error(f"Failed to cleanup hosts file: {str(e)}")
+            
+            return {
+                "success": True, 
+                "message": "Linux VPN blocking measures removed."
+            }
+        except Exception as e:
+            return {
+                "success": False, 
+                "message": f"Failed to stop Linux VPN blocking: {str(e)}"
+            }
+
+
+class SecurityDashboard(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.vpn_status = "Disconnected"
+        self.is_blocking = False
+        self.os_type = platform.system()
+        self.public_ip_info = DEFAULT_IP_INFO
+        self.local_ip_info = DEFAULT_IP_INFO
+        self.activity_log_items = []
+        self.mongo_client = None
+        self.db = None
+        self.mongo_collection = None
+        self.detection_thread = None
+        self.vpn_detection_results = None
+
+        # Initialize display attributes
+        self.public_ip_display = QLabel("Fetching...")
+        self.local_ip_display = QLabel("Fetching...")
+        self.vpn_status_display = QLabel("Checking...")  
+
+        self.setup_logging()
+        self.init_mongodb()
+        self.init_ui()
+        self.start_data_refresh_timer()
+
+    def setup_logging(self):
+        log_file = self.get_os_log_file(self.os_type)
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+    
+    def get_os_log_file(self, os_type):
+        return '/var/log/vpn_blocker.log' if os_type == "Linux" else 'C:\\vpn_blocker.log'
+
+    def init_mongodb(self):
+        try:
+            self.mongo_client = MongoClient(DEFAULT_DB_URL)
+            self.db = self.mongo_client[DB_NAME]
+            self.mongo_collection = self.db[COLLECTION_NAME]
+            self.log_activity("MongoDB connection established.")
+        except errors.ConnectionFailure as e:
+            self.log_activity(f"MongoDB connection failed: {e}")
+            QMessageBox.critical(self, "Database Error",
+                                 f"Could not connect to MongoDB. Functionality might be limited.\nError: {e}")
+            self.mongo_client = None
+
+    def log_activity(self, message):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"{timestamp}: {message}"
+        self.activity_log_items.insert(0, log_message)
+        if len(self.activity_log_items) > MAX_LOG_ENTRIES:
+            self.activity_log_items.pop()
+        if hasattr(self, 'activity_list'):
+            self.update_activity_log_display()
+        logging.info(message)
+
+    def update_activity_log_display(self):
+        self.activity_list.clear()
+        for log_item in self.activity_log_items:
+            item = QListWidgetItem(log_item)
+            self.activity_list.addItem(item)
+
+    def start_data_refresh_timer(self):
+        self.data_refresh_timer = QTimer(self)
+        self.data_refresh_timer.timeout.connect(self.refresh_data)
+        self.data_refresh_timer.start(DATA_REFRESH_INTERVAL)
+
+    def refresh_data(self):
+        self.log_activity("Refreshing data...")
+        self.update_ip_info()
+        self.update_vpn_status_display()
+        self.log_activity("Data refreshed.")
+
+    def init_ui(self):
+        self.setWindowTitle('CheckBlock')
+        self.setMinimumSize(800, 600)
+
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+
+        # Status indicators
+        main_layout.addLayout(self.create_status_indicator())
+
+        # Logo
+        main_layout.addWidget(self.create_logo_label())
+
+        # Separator
+        main_layout.addWidget(self.create_separator())
+
+        # IP Information Grid
+        main_layout.addLayout(self.create_ip_grid())
+
+        # VPN and Activity Log Grid
+        main_layout.addLayout(self.create_status_grid())
+
+        # Bottom Buttons
+        main_layout.addLayout(self.create_button_layout())
+
+        # Initial data update
+        self.refresh_data()
+
+    def create_status_indicator(self):
+        status_layout = QHBoxLayout()
+        for color in STATUS_COLORS:
+            indicator = QFrame()
+            indicator.setFixedSize(10, 10)
+            indicator.setStyleSheet(f'''
+                QFrame {{
+                    background-color: {color};
+                    border-radius: 5px;
+                }}
+            ''')
+            status_layout.addWidget(indicator)
+        status_layout.addStretch()
+        
+        # Add current date/time at top right (real-time)
+        self.date_time_label = QLabel()
+        self.update_datetime()
+        self.date_time_label.setStyleSheet("color: #666666;")
+        status_layout.addWidget(self.date_time_label)
+        
+        # Setup timer to update datetime every second
+        self.datetime_timer = QTimer(self)
+        self.datetime_timer.timeout.connect(self.update_datetime)
+        self.datetime_timer.start(1000)  # Update every second
+        
+        return status_layout
+    
+    def update_datetime(self):
+        """Update the datetime display with current time"""
+        current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.date_time_label.setText(current_datetime)
+
+    def create_logo_label(self):
+        logo_label = QLabel()
+        logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo_label.setStyleSheet('background-color: #f3f4f6; padding: 10px;')
+
+        logo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'resources', 'Logo.png')
+        if os.path.exists(logo_path):
+            pixmap = QPixmap(logo_path)
+            logo_label.setPixmap(pixmap.scaledToHeight(100, Qt.SmoothTransformation))
+        
+            
+        return logo_label
+
+    def create_separator(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet('background-color: #e5e7eb;')
+        return line
+
+    def create_ip_grid(self):
+        ip_grid = QGridLayout()
+        ip_grid.addWidget(self.create_ip_frame('Public IP Information', self.public_ip_display), 0, 0)
+        ip_grid.addWidget(self.create_ip_frame('Local IP Information', self.local_ip_display), 0, 1)
+        return ip_grid
+
+    def create_ip_frame(self, label_text, ip_display_widget):
+        ip_frame = QFrame()
+        ip_frame.setStyleSheet('''
+            QFrame {
+                background-color: white;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+            }
+        ''')
+        ip_layout = QVBoxLayout(ip_frame)
+        ip_label = QLabel(label_text)
+        ip_label.setStyleSheet('font-weight: bold; padding: 5px;')
+        ip_layout.addWidget(ip_label)
+
+        # Create scroll area for both IP info displays
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet('''
+            QScrollArea {            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+        ''')
+        
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        
+        ip_display_widget.setStyleSheet('background-color: #f3f4f6; border: 2px dashed #e5e7eb; border-radius: 8px; padding: 5px;')
+        scroll_layout.addWidget(ip_display_widget)
+        scroll_layout.addStretch()
+        
+        scroll_content.setLayout(scroll_layout)
+        scroll_area.setWidget(scroll_content)
+        
+        ip_layout.addWidget(scroll_area)
+            
+        return ip_frame
+
+    def create_status_grid(self):
+        status_grid = QGridLayout()
+        status_grid.addWidget(self.create_vpn_status_box(), 0, 0)
+        status_grid.addWidget(self.create_activity_log_box(), 0, 1)
+        return status_grid
+
+    def create_vpn_status_box(self):
+        vpn_frame = QFrame()
+        vpn_frame.setStyleSheet('''
+            QFrame {
+                background-color: white;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+            }
+        ''')
+        vpn_layout = QVBoxLayout(vpn_frame)
+
+        vpn_header = QHBoxLayout()
+        vpn_label = QLabel('VPN Status')
+        vpn_label.setStyleSheet('font-weight: bold;')
+        vpn_header.addWidget(vpn_label)
+
+        self.vpn_button = QPushButton(self.vpn_status)
+        self.vpn_button.clicked.connect(self.toggle_vpn)
+        self.update_vpn_button_style()
+        vpn_header.addWidget(self.vpn_button)
+
+        vpn_layout.addLayout(vpn_header)
+        
+        # VPN Confidence Meter
+        confidence_layout = QHBoxLayout()
+        confidence_label = QLabel("Detection Confidence:")
+        confidence_label.setStyleSheet("font-size: 12px;")
+        confidence_layout.addWidget(confidence_label)
+        
+        self.confidence_bar = QProgressBar()
+        self.confidence_bar.setRange(0, 100)
+        self.confidence_bar.setValue(0)
+        self.confidence_bar.setTextVisible(True)
+        self.confidence_bar.setFormat("%v%")
+        self.confidence_bar.setStyleSheet('''
+            QProgressBar {
+                border: 1px solid #e5e7eb;
+                border-radius: 5px;
+                text-align: center;
+                max-height: 12px;
+            }
+            QProgressBar::chunk {
+                background-color: #16A34A;
+                border-radius: 5px;
+            }
+        ''')
+        confidence_layout.addWidget(self.confidence_bar)
+        vpn_layout.addLayout(confidence_layout)
+        
+        # VPN Status Display
+        self.vpn_status_display.setStyleSheet(
+            'background-color: #f3f4f6; border: 2px dashed #e5e7eb; border-radius: 8px; min-height: 32px; padding: 5px;')
+        vpn_layout.addWidget(self.vpn_status_display)
+        
+        # Detection Status Label (no API details)
+        self.detection_status_label = QLabel("Detection Status: Not checked")
+        self.detection_status_label.setStyleSheet("font-size: 12px; margin-top: 10px; font-style: italic;")
+        vpn_layout.addWidget(self.detection_status_label)
+        
+        # Refresh button
+        refresh_layout = QHBoxLayout()
+        refresh_layout.addStretch()
+        
+        refresh_btn = QPushButton("Refresh Detection")
+        refresh_btn.setStyleSheet('''
+            QPushButton {
+                background-color: #3B82F6;
+                color: white;
+                border-radius: 4px;
+                padding: 4px 10px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #2563EB;
+            }
+        ''')
+        refresh_btn.clicked.connect(self.perform_vpn_detection)
+        refresh_layout.addWidget(refresh_btn)
+        
+        vpn_layout.addLayout(refresh_layout)
+        
+        return vpn_frame
+
+    def create_activity_log_box(self):
+        activity_frame = QFrame()
+        activity_frame.setStyleSheet('''
+            QFrame {
+                background-color: white;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+            }
+        ''')
+        activity_layout = QVBoxLayout(activity_frame)
+        activity_label = QLabel('Activity Log')
+        activity_label.setStyleSheet('font-weight: bold; padding: 5px;')
+        activity_layout.addWidget(activity_label)
+
+        self.activity_list = QListWidget()
+        self.activity_list.setStyleSheet('''
+            QListWidget {
+                background-color: white;
+                border: none;
+            }
+            QListWidget::item {
+                background-color: #f3f4f6;
+                border-radius: 4px;
+                padding: 5px;
+                margin: 2px 0;
+            }
+        ''')
+        activity_layout.addWidget(self.activity_list)
+        return activity_frame
+
+    def create_button_layout(self):
+        button_layout = QHBoxLayout()
+
+        self.block_button = QPushButton('Start Blocking')
+        self.block_button.clicked.connect(self.confirm_block_vpn)
+        self.update_block_button_style()
+        button_layout.addWidget(self.block_button)
+
+        refresh_button = QPushButton('Refresh')
+        refresh_button.setStyleSheet('''
+            QPushButton {
+                background-color: #F59E0B;
+                color: white;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #D97706;
+            }
+        ''')
+        refresh_button.clicked.connect(self.refresh_data)
+        button_layout.addWidget(refresh_button)
+        
+        export_button = QPushButton('Export Report')
+        export_button.setStyleSheet('''
+            QPushButton {
+                background-color: #3B82F6;
+                color: white;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #2563EB;
+            }
+        ''')
+        export_button.clicked.connect(self.export_report)
+        button_layout.addWidget(export_button)
+
+        return button_layout
+
+    def toggle_vpn(self):
+        self.vpn_status = "Connected" if self.vpn_status == "Disconnected" else "Disconnected"
+        self.log_activity(f"VPN Status changed to: {self.vpn_status}")
+        self.vpn_button.setText(self.vpn_status)
+        self.update_vpn_button_style()
+        self.update_vpn_status_display()
+
+    def update_vpn_button_style(self):
+        color = "#22C55E" if self.vpn_status == "Connected" else "#EF4444"
+        self.vpn_button.setStyleSheet(f'''
+            QPushButton {{
+                background-color: {color};
+                color: white;
+                border-radius: 12px;
+                padding: 4px 12px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {"#16A34A" if self.vpn_status == "Connected" else "#DC2626"};
+            }}
+        ''')
+
+    def confirm_block_vpn(self):
+        if self.is_blocking:
+            self.toggle_blocking(stop=True)
+            return
+
+        confirm_dialog = QMessageBox()
+        confirm_dialog.setIcon(QMessageBox.Question)
+        confirm_dialog.setText("Do you want to start VPN blocking?\nThis action requires administrator privileges and will attempt to block VPN connections system-wide.")
+        confirm_dialog.setWindowTitle("Confirm VPN Blocking")
+        confirm_dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        confirm_dialog.setDefaultButton(QMessageBox.No)
+
+        if confirm_dialog.exec_() == QMessageBox.Yes:
+            if self.is_admin():
+                self.toggle_blocking()
+            else:
+                QMessageBox.critical(self, "Permissions Error", "VPN blocking requires administrator privileges. Please run the application as administrator.")
+                self.log_activity("VPN Blocking start cancelled due to insufficient privileges.")
+        else:
+            self.log_activity("VPN Blocking start cancelled by user.")
+
+    def toggle_blocking(self, stop=False):
+        """Toggle VPN blocking on/off"""
+        if not self.is_blocking and not stop:
+            if self.os_type == "Linux" and os.geteuid() != 0:
+                QMessageBox.critical(self, "Permissions Error", "VPN blocking requires root privileges. Please run the application as root.")
+                self.log_activity("VPN Blocking start cancelled due to insufficient privileges.")
+                return
+            elif self.os_type == "Windows" and not self.is_admin():
+                QMessageBox.critical(self, "Permissions Error", "VPN blocking requires administrator privileges. Please run the application as administrator.")
+                self.log_activity("VPN Blocking start cancelled due to insufficient privileges.")
+                return
+        
+        # Start the blocking thread
+        action = "stop" if stop or self.is_blocking else "start"
+        self.blocker_thread = VPNBlockerThread(action)
+        self.blocker_thread.blocking_status.connect(self.handle_blocking_result)
+        self.blocker_thread.start()
+        
+        self.block_button.setEnabled(False)
+        self.block_button.setText("Please wait...")
+        
+        self.log_activity(f"VPN blocking {action} operation initiated...")
+
+    def handle_blocking_result(self, result):
+        """Handle result from blocking thread"""
+        success = result.get("success", False)
+        message = result.get("message", "Unknown status")
+        
+        if success:
+            if not self.is_blocking:
+                self.is_blocking = True
+                self.log_activity("VPN blocking enabled successfully.")
+            else:
+                self.is_blocking = False
+                self.log_activity("VPN blocking disabled.")
+        else:
+            self.log_activity(f"VPN blocking operation failed: {message}")
+            QMessageBox.critical(self, "Operation Failed", message)
+        
+        self.block_button.setEnabled(True)
+        self.update_block_button_style()
+
+    def update_block_button_style(self):
+        color = "#EF4444" if self.is_blocking else "#22C55E"
+        hover_color = "#DC2626" if self.is_blocking else "#16A34A"
+        button_text = "Stop Blocking" if self.is_blocking else "Start Blocking"
+        self.block_button.setText(button_text)
+        self.block_button.setStyleSheet(f'''
+            QPushButton {{
+                background-color: {color};
+                color: white;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {hover_color};
+            }}
+        ''')
+
+    def perform_vpn_detection(self):
+        """Start the VPN detection process"""
+        self.log_activity("Starting VPN detection...")
+        self.vpn_status_display.setText("Detecting VPN status...")
+        self.detection_status_label.setText("Detection Status: Checking...")
+        
+        # Stop previous detection thread if running
+        if self.detection_thread and self.detection_thread.isRunning():
+            self.detection_thread.terminate()
+            self.detection_thread.wait()
+        
+        # Start new detection thread
+        self.detection_thread = VPNDetectionThread()
+        self.detection_thread.detection_complete.connect(self.handle_detection_result)
+        self.detection_thread.start()
+    
+    def handle_detection_result(self, result):
+        """Process VPN detection results"""
+        self.vpn_detection_results = result
+        
+        if "error" in result:
+            self.log_activity(f"VPN detection error: {result['error']}")
+            self.vpn_status_display.setText(f"Error: {result['error']}")
+            self.detection_status_label.setText("Detection Status: Error")
+            return
+        
+        # Update confidence bar
+        confidence = result.get("confidence", 0)
+        self.confidence_bar.setValue(confidence)
+        
+        # Update color based on confidence
+        if confidence < 40:
+            self.confidence_bar.setStyleSheet('''
+                QProgressBar {
+                    border: 1px solid #e5e7eb;
+                    border-radius: 5px;
+                    text-align: center;
+                    max-height: 12px;
+                }
+                QProgressBar::chunk {
+                    background-color: #22C55E; /* Green */
+                    border-radius: 5px;
+                }
+            ''')
+        elif confidence < 70:
+            self.confidence_bar.setStyleSheet('''
+                QProgressBar {
+                    border: 1px solid #e5e7eb;
+                    border-radius: 5px;
+                    text-align: center;
+                    max-height: 12px;
+                }
+                QProgressBar::chunk {
+                    background-color: #F59E0B; /* Yellow */
+                    border-radius: 5px;
+                }
+            ''')
+        else:
+            self.confidence_bar.setStyleSheet('''
+                QProgressBar {
+                    border: 1px solid #e5e7eb;
+                    border-radius: 5px;
+                    text-align: center;
+                    max-height: 12px;
+                }
+                QProgressBar::chunk {
+                    background-color: #EF4444; /* Red */
+                    border-radius: 5px;
+                }
+            ''')
+        
+        # Update VPN status based on confidence > 50% check
+        is_vpn = result.get("isVPN", False)
+        
+        if is_vpn:
+            self.vpn_status = "Connected"
+            self.vpn_button.setText("Connected")
+            self.update_vpn_button_style()
+            
+            location = result.get("location", {})
+            location_str = f"{location.get('city', 'Unknown')}, {location.get('region', 'Unknown')}, {location.get('country', 'Unknown')}"
+            
+            status_text = f"VPN DETECTED\n\nConfidence: {confidence}%\n\nLocation: {location_str}\n\nIP: {result.get('ip', 'Unknown')}"
+            self.vpn_status_display.setText(status_text)
+            
+            self.log_activity(f"VPN detected with {confidence}% confidence.")
+            self.detection_status_label.setText("Detection Status: VPN Detected")
+        else:
+            self.vpn_status = "Disconnected"
+            self.vpn_button.setText("Disconnected")
+            self.update_vpn_button_style()
+            
+            status_text = f"NO VPN DETECTED\n\nConfidence: {confidence}%\n\nIP: {result.get('ip', 'Unknown')}"
+            self.vpn_status_display.setText(status_text)
+            
+            self.log_activity(f"No VPN detected ({confidence}% confidence).")
+            self.detection_status_label.setText("Detection Status: No VPN Detected")
+        
+        # Store results in MongoDB if available
+        if self.mongo_client:
+            try:
+                self.mongo_collection.insert_one({
+                    "timestamp": datetime.now(),
+                    "ip": result.get("ip"),
+                    "isVPN": is_vpn,
+                    "confidence": confidence,
+                    "location": result.get("location", {})
+                })
+            except Exception as e:
+                self.log_activity(f"Failed to store detection result in database: {str(e)}")
+                
+    def update_vpn_status_display(self):
+        """Update the VPN status display"""
+        if hasattr(self, "vpn_detection_results") and self.vpn_detection_results:
+            # Already have results, use them
+            self.handle_detection_result(self.vpn_detection_results)
+        else:
+            # No results yet, perform detection
+            self.perform_vpn_detection()
+
+    def update_ip_info(self):
+        """Update IP information"""
+        try:
+            # Get public IP
+            ip_response = requests.get('https://api.ipify.org?format=json', timeout=5)
+            public_ip = ip_response.json().get('ip')
+            
+            if public_ip:
+                # Use IPinfo.io for location data
+                url = f"https://ipinfo.io/{public_ip}/json?token={IPINFO_API_KEY}"
+                response = requests.get(url, timeout=5)
+                data = response.json()
+                
+                # Parse location
+                if 'loc' in data and ',' in data['loc']:
+                    lat, lon = data['loc'].split(',')
+                else:
+                    lat, lon = 'N/A', 'N/A'
+                
+                self.public_ip_info = {
+                    "ip": public_ip,
+                    "country": data.get('country', 'N/A'),
+                    "region": data.get('region', 'N/A'),
+                    "city": data.get('city', 'N/A'),
+                    "location": f"{data.get('city', 'N/A')}, {data.get('region', 'N/A')}, {data.get('country', 'N/A')}",
+                    "latitude": lat,
+                    "longitude": lon,
+                    "isp": data.get('org', 'N/A'),
+                    "timezone": data.get('timezone', 'N/A')
+                }
+            else:
+                self.public_ip_info = {"ip": "Unavailable", "location": "Unavailable"}
+        except Exception as e:
+            self.log_activity(f"Failed to fetch public IP info: {str(e)}")
+            self.public_ip_info = {"ip": "Error", "location": "Error: " + str(e)}
+        
+        try:
+            # Get local IP info
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+            
+            # Get local machine geolocation
+            local_location = GeoLocationFinder.get_local_geolocation() or {}
+            
+            self.local_ip_info = {
+                "local_ip": local_ip,
+                "hostname": hostname,
+                "os": platform.system(),
+                "os_version": platform.version(),
+                "machine": platform.machine(),
+                "city": local_location.get('city', 'Unknown'),
+                "region": local_location.get('region', 'Unknown'),
+                "country": local_location.get('country', 'Unknown'),
+                "latitude": local_location.get('latitude', 'Unknown'),
+                "longitude": local_location.get('longitude', 'Unknown'),
+                "detection_method": local_location.get('method', 'Unknown')
+            }
+        except Exception as e:
+            self.log_activity(f"Failed to fetch local IP info: {str(e)}")
+            self.local_ip_info = {"local_ip": "Error", "hostname": "Error: " + str(e)}
+        
+        self.update_ip_display_labels()
+
+    def update_ip_display_labels(self):
+        """Update IP display labels with fetched information"""
+        public_ip_text = f"IP: {self.public_ip_info.get('ip', 'N/A')}\n"
+        public_ip_text += f"Location: {self.public_ip_info.get('location', 'N/A')}\n"
+        public_ip_text += f"Latitude: {self.public_ip_info.get('latitude', 'N/A')}\n"
+        public_ip_text += f"Longitude: {self.public_ip_info.get('longitude', 'N/A')}\n"
+        public_ip_text += f"ISP: {self.public_ip_info.get('isp', 'N/A')}\n"
+        public_ip_text += f"Timezone: {self.public_ip_info.get('timezone', 'N/A')}"
+        self.public_ip_display.setText(public_ip_text)
+
+        local_ip_text = f"IP: {self.local_ip_info.get('local_ip', 'N/A')}\n"
+        local_ip_text += f"Hostname: {self.local_ip_info.get('hostname', 'N/A')}\n"
+        local_ip_text += f"OS: {self.local_ip_info.get('os', 'N/A')}\n"
+        local_ip_text += f"OS Version: {self.local_ip_info.get('os_version', 'N/A')}\n"
+        local_ip_text += f"Machine: {self.local_ip_info.get('machine', 'N/A')}\n"
+        local_ip_text += f"Local City: {self.local_ip_info.get('city', 'Unknown')}\n"
+        local_ip_text += f"Local Region: {self.local_ip_info.get('region', 'Unknown')}\n" 
+        local_ip_text += f"Local Country: {self.local_ip_info.get('country', 'Unknown')}"
+        self.local_ip_display.setText(local_ip_text)
+
+    def export_report(self):
+        """Export a detailed report of VPN detection results"""
+        if not hasattr(self, "vpn_detection_results") or not self.vpn_detection_results:
+            QMessageBox.information(self, "No Data", "No VPN detection results available yet. Please run a detection first.")
+            return
+        
+        try:
+            # Generate HTML report
+            report_path = os.path.join(os.path.expanduser("~"), f"vpn_detection_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+            
+            with open(report_path, "w") as f:
+                f.write('''
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>VPN Detection Report</title>
+                    <style>
+                        body {
+                            font-family: Arial, sans-serif;
+                            line-height: 1.6;
+                            margin: 0;
+                            padding: 20px;
+                            color: #333;
+                        }
+                        h1 {
+                            color: #2563EB;
+                            border-bottom: 2px solid #2563EB;
+                            padding-bottom: 10px;
+                        }
+                        h2 {
+                            color: #1F2937;
+                            margin-top: 20px;
+                        }
+                        .container {
+                            max-width: 800px;
+                            margin: 0 auto;
+                            background: #fff;
+                            padding: 20px;
+                            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                        }
+                        .header {
+                            background: #f3f4f6;
+                            padding: 20px;
+                            margin-bottom: 20px;
+                            border-radius: 5px;
+                        }
+                        .section {
+                            margin-bottom: 20px;
+                            padding: 15px;
+                            background: #f9fafb;
+                            border-radius: 5px;
+                        }
+                        .result {
+                            padding: 10px;
+                            border-radius: 5px;
+                            margin-bottom: 10px;
+                        }
+                        .vpn-detected {
+                            background-color: #fee2e2;
+                            border-left: 5px solid #ef4444;
+                        }
+                        .no-vpn-detected {
+                            background-color: #d1fae5;
+                            border-left: 5px solid #10b981;
+                        }
+                        .footer {
+                            margin-top: 30px;
+                            text-align: center;
+                            color: #6B7280;
+                            font-size: 0.8rem;
+                        }
+                        table {
+                            width: 100%;
+                            border-collapse: collapse;
+                        }
+                        table, th, td {
+                            border: 1px solid #e5e7eb;
+                        }
+                        th, td {
+                            padding: 8px;
+                            text-align: left;
+                        }
+                        th {
+                            background-color: #f3f4f6;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="header">
+                            <h1>VPN Detection Report</h1>
+                            <p>Generated on: 2025-03-03 06:08:26</p>
+                            <p>Login: Tarun1516</p>
+                            <p>IP Address: ''' + self.vpn_detection_results.get('ip', 'Unknown') + '''</p>
+                        </div>
+                ''')
+                
+                # Main result section
+                is_vpn = self.vpn_detection_results.get('isVPN', False)
+                confidence = self.vpn_detection_results.get('confidence', 0)
+                result_class = "vpn-detected" if is_vpn else "no-vpn-detected"
+                
+                f.write(f'''
+                        <div class="section">
+                            <h2>Detection Result</h2>
+                            <div class="result {result_class}">
+                                <h3>{"VPN DETECTED" if is_vpn else "NO VPN DETECTED"}</h3>
+                                <p>Confidence score: {confidence}%</p>
+                                <p>Detection timestamp: {self.vpn_detection_results.get('timestamp', '2025-03-03 06:08:26')}</p>
+                            </div>
+                        </div>
+                ''')
+                
+                # Location information - show both public and local
+                public_location = self.vpn_detection_results.get("location", {})
+                local_location = self.vpn_detection_results.get("local_location", {})
+                
+                f.write('''
+                        <div class="section">
+                            <h2>Location Information</h2>
+                            <h3>Public IP Location</h3>
+                            <table>
+                                <tr>
+                                    <th>Property</th>
+                                    <th>Value</th>
+                                </tr>
+                ''')
+                
+                for key, value in public_location.items():
+                    f.write(f'''
+                                <tr>
+                                    <td>{key.capitalize()}</td>
+                                    <td>{value}</td>
+                                </tr>
+                    ''')
+                
+                f.write('''
+                            </table>
+                            
+                            <h3>Local Machine Location</h3>
+                            <table>
+                                <tr>
+                                    <th>Property</th>
+                                    <th>Value</th>
+                                </tr>
+                ''')
+                
+                for key, value in local_location.items():
+                    if key != 'method':  # Skip technical details
+                        f.write(f'''
+                                    <tr>
+                                        <td>{key.capitalize()}</td>
+                                        <td>{value}</td>
+                                    </tr>
+                        ''')
+                
+                f.write('''
+                            </table>
+                        </div>
+                ''')
+                
+                # System checks
+                details = self.vpn_detection_results.get("details", {})
+                f.write('''
+                        <div class="section">
+                            <h2>System Checks</h2>
+                            <ul>
+                ''')
+                
+                if details.get("vpnProcesses", False):
+                    f.write('''
+                                <li>VPN processes detected on the system</li>
+                    ''')
+                else:
+                    f.write('''
+                                <li>No VPN processes detected on the system</li>
+                    ''')
+                    
+                if details.get("vpnInterfaces", False):
+                    f.write('''
+                                <li>VPN network interfaces detected on the system</li>
+                    ''')
+                else:
+                    f.write('''
+                                <li>No VPN network interfaces detected on the system</li>
+                    ''')
+                
+                if details.get("locationMismatch", False):
+                    f.write(f'''
+                                <li>Location mismatch detected between public IP and system: {details.get("locationMismatchReason", "Unknown reason")}</li>
+                    ''')
+                else:
+                    f.write('''
+                                <li>No location mismatch detected</li>
+                    ''')
+                    
+                f.write('''
+                            </ul>
+                        </div>
+                ''')
+                
+                # Technical details
+                f.write('''
+                        <div class="section">
+                            <h2>Technical Details</h2>
+                            <p>The following checks were performed:</p>
+                            <ul>
+                                <li>Multiple API verification services</li>
+                                <li>System-level detection of VPN software</li>
+                                <li>Network configuration analysis</li>
+                                <li>DNS leak detection</li>
+                                <li>Network timing analysis</li>
+                                <li>Location comparison</li>
+                            </ul>
+                        </div>
+                ''')
+                
+                # Footer
+                f.write('''
+                        <div class="footer">
+                            <p>This report was generated by CheckBlock VPN Detection Tool</p>
+                            <p>Current date/time: 2025-03-03 06:08:26</p>
+                            <p>Login: Tarun1516</p>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                ''')
+            
+            self.log_activity(f"Report exported to {report_path}")
+            QMessageBox.information(self, "Report Generated", f"Report saved to {report_path}")
+            
+            # Open the report in the default browser
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(report_path))
+            except:
+                # Fallback method if QtDesktopServices fails
+                if platform.system() == 'Darwin':  # macOS
+                    subprocess.call(('open', report_path))
+                elif platform.system() == 'Windows':  # Windows
+                    os.startfile(report_path)
+                else:  # Linux variants
+                    subprocess.call(('xdg-open', report_path))
+                
+        except Exception as e:
+            self.log_activity(f"Failed to export report: {str(e)}")
+            QMessageBox.critical(self, "Export Failed", f"Failed to export report: {str(e)}")
+
+    def is_admin(self):
+        """Check if the application is running with admin privileges"""
+        if self.os_type == "Windows":
+            try:
+                import ctypes
+                return ctypes.windll.shell32.IsUserAnAdmin() != 0
+            except:
+                return False
+        elif self.os_type == "Linux":
+            return os.geteuid() == 0
+        else:
+            return False
+
+if __name__ == '__main__':
+    try:
+        app = QApplication(sys.argv)
+        window = SecurityDashboard()
+        window.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        logging.critical(f"Application crashed: {str(e)}")
+        print(f"Fatal error: {str(e)}")
+        if QApplication.instance():
+            QMessageBox.critical(None, "Fatal Error", f"Application crashed: {str(e)}")
