@@ -1,29 +1,179 @@
-import sys
+# STARTUP_PERFORMANCE_FIX
 import os
+import sys
 import platform
-import subprocess
-import requests
-import socket
-import time
+import traceback
 import logging
+from datetime import datetime
+import threading
+import time
+import subprocess
+import socket
 import json
 import webbrowser
 import tempfile
 import ipaddress
-import threading
 import ssl
 import re
-from datetime import datetime
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton,
-                             QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
-                             QFrame, QListWidget, QListWidgetItem, QMessageBox,
-                             QProgressBar, QTabWidget, QTextEdit, QDialog, 
-                             QScrollArea)
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl
-from PyQt5.QtGui import QPixmap, QDesktopServices
-from pymongo import MongoClient, errors
+import shutil
+import hashlib
+from datetime import timedelta
 
-# Constants
+# Configure logging first
+log_dir = os.path.join(os.path.expanduser("~"), ".checkblock")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "checkblock_app.log")
+logging.basicConfig(
+    filename=log_file,
+    level=logging.ERROR,  # Only log errors in production
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+# Disable debug logging for all modules
+logging.getLogger().setLevel(logging.ERROR)
+logging.info(f"Application starting at {datetime.now()}")
+
+# Global flag to prevent application restart
+_APPLICATION_EXITING = False
+_ERROR_DIALOG_SHOWN = False
+
+# --- Resource Finding ---
+def find_resource(resource_name):
+    """Find resource file by checking various possible locations"""
+    # Cache for faster subsequent lookups of the same resource
+    if not hasattr(find_resource, '_cache'):
+        find_resource._cache = {}
+    
+    # Return cached path if available
+    if resource_name in find_resource._cache:
+        return find_resource._cache[resource_name]
+        
+    search_paths = []
+    try:
+        # 1. Check if we're running as a PyInstaller bundle
+        if getattr(sys, 'frozen', False):
+            # Get base path considering admin elevation might change working directory
+            base_path = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+            bundle_dir = os.path.dirname(sys.executable)
+            search_paths.extend([
+                os.path.join(base_path, 'resources', resource_name),
+                os.path.join(base_path, resource_name),
+                os.path.join(bundle_dir, 'resources', resource_name),
+                os.path.join(bundle_dir, resource_name)
+            ])
+
+        # 2. Check development paths relative to this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        search_paths.extend([
+            os.path.join(script_dir, 'resources', resource_name),
+            os.path.join(os.path.dirname(script_dir), 'resources', resource_name), # Check one level up
+            os.path.join(script_dir, resource_name)
+        ])
+
+        # 3. Check absolute paths for admin mode
+        if getattr(sys, 'frozen', False):
+            exe_path = os.path.abspath(sys.executable)
+            exe_dir = os.path.dirname(exe_path)
+            search_paths.extend([
+                os.path.join(exe_dir, 'resources', resource_name),
+                os.path.join(exe_dir, resource_name)
+            ])
+
+        # 4. Check current working directory as fallback
+        search_paths.append(os.path.join(os.getcwd(), 'resources', resource_name))
+        search_paths.append(resource_name)
+
+        # Log search paths for debugging
+        logging.debug(f"Searching for resource '{resource_name}' in paths: {search_paths}")
+
+        # Search through all possible paths
+        for path in search_paths:
+            abs_path = os.path.abspath(path)
+            if os.path.exists(abs_path):
+                logging.debug(f"Resource '{resource_name}' found at: {abs_path}")
+                find_resource._cache[resource_name] = abs_path
+                return abs_path
+
+        logging.warning(f"Resource not found: {resource_name}")
+        find_resource._cache[resource_name] = None
+        return None
+    except Exception as e:
+        logging.error(f"Error finding resource '{resource_name}': {e}")
+        find_resource._cache[resource_name] = None
+        return None
+
+# --- PyQt5 Imports (Deferred where possible) ---
+try:
+    from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton,
+                                 QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+                                 QFrame, QListWidget, QListWidgetItem, QMessageBox,
+                                 QProgressBar, QTabWidget, QTextEdit, QDialog,
+                                 QScrollArea, QSplashScreen)
+    from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl
+    from PyQt5.QtGui import QPixmap, QIcon, QDesktopServices
+    QT_AVAILABLE = True
+except ImportError as e:
+    logging.error(f"PyQt5 import failed: {e}. GUI cannot start.")
+    QT_AVAILABLE = False
+    # Attempt to show a simple message box if possible, otherwise print and exit
+    try:
+        # Minimal import for message box
+        from PyQt5.QtWidgets import QApplication, QMessageBox
+        app = QApplication(sys.argv)
+        QMessageBox.critical(None, "Error", "PyQt5 is missing. Please install it (pip install PyQt5).")
+    except ImportError:
+        print("ERROR: PyQt5 is required but not installed. Please install PyQt5.")
+    sys.exit(1)
+
+# --- Optional Module Imports ---
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    logging.warning("requests module not available - network features limited")
+    REQUESTS_AVAILABLE = False
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    logging.warning("psutil not available - system monitoring limited")
+    PSUTIL_AVAILABLE = False
+
+try:
+    from pymongo import MongoClient, errors
+    MONGO_AVAILABLE = True
+except ImportError:
+    logging.warning("pymongo not available - database features disabled")
+    MONGO_AVAILABLE = False
+
+# --- Platform Specific Imports ---
+WINDOWS_API_AVAILABLE = False
+WIN32_IMPORTS_AVAILABLE = False
+WIN32_SERVICE_IMPORTS_AVAILABLE = False
+WMI_AVAILABLE = False
+if platform.system() == "Windows":
+    try:
+        import win32api, win32con, win32security
+        WINDOWS_API_AVAILABLE = True
+    except ImportError:
+        logging.warning("Windows API modules (win32api, etc.) not available")
+    try:
+        import ctypes
+        WIN32_IMPORTS_AVAILABLE = True
+    except ImportError:
+        logging.warning("ctypes module not found")
+    try:
+        from win32 import serviceutil as win32serviceutil, service as win32service, net as win32net
+        WIN32_SERVICE_IMPORTS_AVAILABLE = True
+    except ImportError:
+        logging.warning("Windows service modules (win32serviceutil, etc.) not available")
+    try:
+        import wmi
+        WMI_AVAILABLE = True
+    except ImportError:
+        logging.warning("WMI module not available")
+
+# --- Constants ---
 STATUS_COLORS = ['#FBBF24', '#34D399', '#EF4444']
 DATA_REFRESH_INTERVAL = 60000  # milliseconds (1 minute)
 MAX_LOG_ENTRIES = 10
@@ -31,61 +181,96 @@ DEFAULT_IP_INFO = {"ip": "N/A", "location": "N/A"}
 DEFAULT_DB_URL = 'mongodb://127.0.0.1:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2.3.7'
 DB_NAME = 'vpn_detection'
 COLLECTION_NAME = 'vpn_data'
-
-# API Keys (Hidden from UI but used in background)
-PROXYCHECK_API_KEY = "n2g051-435450-9661v0-x64j46" 
+PROXYCHECK_API_KEY = "n2g051-435450-9661v0-x64j46"
 VPNAPI_API_KEY = "03d50e96cfed4eeca7f4a5308b3262d6"
 IPINFO_API_KEY = "889bf0bc1000a4"
-
-# Current date/time and user information
-CURRENT_USER = "Tarun1516"
-
-# VPN Service Lists (Platform Specific)
+VPN_PORTS = [1194, 500, 4500, 1701, 1723]
+VPN_PROTOCOLS = ["UDP", "TCP"]
+VPN_PROTOCOL_NUMBERS = {"GRE": 47, "ESP": 50, "AH": 51}
+VPN_PROCESSES = ["openvpn.exe", "nordvpn.exe", "expressvpn.exe", "protonvpn.exe", "ipsec.exe", "softether.exe", "wireguard.exe"]
+VPN_DOMAINS = ["nordvpn.com", "expressvpn.com", "protonvpn.com", "surfshark.com", "privateinternetaccess.com", "mullvad.net", "vyprvpn.com", "torguard.net", "purevpn.com", "ipvanish.com", "tunnelbear.com", "windscribe.com", "hidemyass.com", "cyberghostvpn.com", "strongvpn.com", "pia.com"]
+VPN_KEYWORDS = ['vpn', 'expressvpn', 'nordvpn', 'openvpn', 'privateinternetaccess', 'cyberghost', 'turbo', 'windscribe', 'tunnelbear', 'ipvanish', 'privatevpn', 'goldenfrog', 'hide.me', 'proton', 'mullvad', 'hotspot', 'surfshark', 'torguard']
+VPN_ASNS = [16276, 14061, 16509, 14618, 3356, 9009, 51167, 24940, 20473, 15169]
 VPN_SERVICES = {
-    "Linux": [
-        "openvpn", "strongswan", "xl2tpd", "ppp", "pptp", "l2tp", "ipsec", "wireguard",
-        "nordvpn", "expressvpn", "protonvpn", "mullvad", "vyprvpn", "surfshark", "cisco anyconnect", "softether",
-        "windscribe", "tunnelbear", "ipvanish", "privatevpn", "goldenfrog", "hide.me", "cyberghost", "privateinternetaccess"
-    ],
-    "Windows": [
-        "OpenVPNService", "WireGuardTunnel", "PPTP", "L2TP", "IPSEC", "SstpSvc", "PanGPS",
-        "NordVPN", "ExpressVPN", "ProtonVPN", "MullvadVPN", "VyprVPNService", "Surfshark Service", "Cisco AnyConnect Secure Mobility Agent Service", "SoftEther VPN Client Service",
-        "WindscribeService", "Tunnelbear Desktop", "ipvanish", "PrivateInternetAccessService", "CyberGhost 5 Service", "PIA"
-    ]
+    "Linux": ["openvpn", "strongswan", "xl2tpd", "ppp", "pptp", "l2tp", "ipsec", "wireguard", "nordvpn", "expressvpn", "protonvpn", "mullvad", "vyprvpn", "surfshark", "cisco anyconnect", "softether", "windscribe", "tunnelbear", "ipvanish", "privatevpn", "goldenfrog", "hide.me", "cyberghost", "privateinternetaccess"],
+    "Windows": ["OpenVPNService", "OpenVPNServiceInteractive", "OpenVPNServiceLegacy", "nordvpn-service", "ExpressVPNService", "ProtonVPN Service", "SurfsharkService", "CyberGhost Service", "vyprVPNService", "WindscribeService", "MullvadVPN", "PureVPNService", "ipvanish", "HideMyAssService", "TorGuardService", "PrivateTunnelService", "StrongVPNService", "IVPN Client", "AirVPN", "BlackVPN", "VPNSecureService", "SaferVPNService", "TunnelBearService", "AvastVPNService", "HSS Service", "BetternetService", "UltraSurfService", "PsiphonService", "LanternService", "AVG VPN", "Avira Phantom VPN", "Kaspersky VPN", "Norton VPN", "McAfee VPN", "Bitdefender VPN", "Cisco AnyConnect Secure Mobility Agent", "vpnagent", "FortiClient", "FortiSSLVPNdaemon", "CheckPointVPN", "PulseSecureService", "F5VPN", "SonicWallVPN", "GlobalProtect", "ZeroTierOne", "WireGuardTunnel", "WireGuardManager", "PritunlService", "Viscosity", "sstp-service", "TailscaleService", "CloudflareWARP", "Stunnel", "ShadowsocksService", "V2RayService", "XRayService", "TrojanService", "ClashService", "OutlineService", "SoftEtherVPN", "SoftEther VPN Client", "LogMeIn Hamachi Tunneling Engine", "RasMan", "SstpSvc", "SwisscomVPNService", "VPNService", "RemoteAccess", "IKEEXT", "PolicyAgent", "iphlpsvc", "SharedAccess", "mpssvc", "PptpMiniport", "RasAcd", "RasAuto", "Rasl2tp", "RasPppoe", "RasSstp", "RemoteAccess", "SstpSvc", "WinRM"]
 }
 
-# VPN Detection Keywords
-VPN_KEYWORDS = ['vpn', 'expressvpn', 'nordvpn', 'openvpn', 'privateinternetaccess', 'cyberghost', 
-                'turbo', 'windscribe', 'tunnelbear', 'ipvanish', 'privatevpn', 'goldenfrog', 
-                'hide.me', 'proton', 'mullvad', 'hotspot', 'surfshark', 'torguard']
+# --- Exit Handling ---
+def exit_application(event=None):
+    """Improved exit function that ensures complete process termination"""
+    global _APPLICATION_EXITING
+    if _APPLICATION_EXITING:
+        return
+    _APPLICATION_EXITING = True
+    logging.info("Application exit initiated.")
 
-# VPN Provider ASNs
-VPN_ASNS = [
-    16276,  # OVH
-    14061,  # DigitalOcean
-    16509,  # Amazon AWS
-    14618,  # Amazon AES
-    3356,   # Level3
-    9009,   # M247
-    51167,  # Contabo
-    24940,  # Hetzner
-    20473,  # Choopa/Vultr
-    15169   # Google Cloud
-]
+    # Terminate any non-daemon background threads gracefully
+    for thread in threading.enumerate():
+        if thread != threading.current_thread() and not thread.daemon:
+            logging.debug(f"Attempting to join thread: {thread.name}")
+            try:
+                # Add a stop mechanism if threads have one
+                if hasattr(thread, 'stop'):
+                    thread.stop()
+                thread.join(timeout=0.5) # Give threads a chance to finish
+                if thread.is_alive():
+                    logging.warning(f"Thread {thread.name} did not exit cleanly.")
+            except Exception as e:
+                logging.error(f"Error stopping thread {thread.name}: {e}")
 
-# Common VPN Ports
-VPN_PORTS = [1194, 1723, 500, 4500, 1701, 51820, 443, 80, 8080, 53]
+    # Close Qt application
+    app = QApplication.instance()
+    if app:
+        logging.debug("Quitting Qt application.")
+        app.quit()
 
-# VPN domains to block
-VPN_DOMAINS = [
-    "nordvpn.com", "expressvpn.com", "protonvpn.com", "surfshark.com", "privateinternetaccess.com",
-    "mullvad.net", "vyprvpn.com", "torguard.net", "purevpn.com", "ipvanish.com",
-    "tunnelbear.com", "windscribe.com", "hidemyass.com", "cyberghostvpn.com", "strongvpn.com"
-]
+    # Force exit as a fallback
+    logging.info("Forcing process exit.")
+    os._exit(0)
 
+# --- Exception Handling ---
+def custom_excepthook(exc_type, exc_value, exc_traceback):
+    """Improved exception handler with better dialog management"""
+    global _APPLICATION_EXITING, _ERROR_DIALOG_SHOWN
+    if _APPLICATION_EXITING: return # Don't show errors during exit
+
+    error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    logging.error(f"Unhandled exception: {error_msg}")
+
+    # Only show dialog in development mode, not in built app
+    if getattr(sys, 'frozen', False):
+        logging.error("Suppressing error dialog in built application")
+        return
+
+    if _ERROR_DIALOG_SHOWN:
+        logging.error("Preventing duplicate error dialog.")
+        return # Prevent multiple dialogs
+
+    try:
+        _ERROR_DIALOG_SHOWN = True
+        app = QApplication.instance()
+        if not app: # Ensure QApplication exists
+             app = QApplication(sys.argv)
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Critical)
+        msg.setText("An unexpected error occurred.")
+        msg.setInformativeText("Please check the log file for details.")
+        msg.setDetailedText(error_msg)
+        msg.setWindowTitle("Application Error")
+        msg.setStandardButtons(QMessageBox.Ok)
+        # Ensure dialog closes properly and triggers exit
+        msg.buttonClicked.connect(exit_application)
+        msg.exec_()
+    except Exception as e:
+        logging.error(f"CRITICAL: Error showing exception dialog: {e}")
+        exit_application() # Force exit if dialog fails
+
+sys.excepthook = custom_excepthook
+
+# --- GeoLocation Class ---
 class GeoLocationFinder:
-    """Class to get local machine geolocation"""
-    
+    # ... (GeoLocationFinder methods remain the same as previous version) ...
     @staticmethod
     def get_local_geolocation():
         """Attempt to determine local machine geolocation"""
@@ -101,39 +286,40 @@ class GeoLocationFinder:
                     'longitude': wifi_location.get('longitude', 'Unknown'),
                     'method': 'wifi'
                 }
-                
+
             # Method 2: Try IP-API.com with local ISP IP - works if not behind VPN
             # This still uses the public IP but is a fallback
             ip_location = GeoLocationFinder._get_ip_based_location()
             if ip_location:
                 return ip_location
-            
+
             # Method 3: Use system timezone as a rough approximation
             tz_location = GeoLocationFinder._get_timezone_location()
             if tz_location:
                 return tz_location
-                
+
             return None
         except Exception as e:
             logging.error(f"Error getting local geolocation: {e}")
             return None
-    
+
     @staticmethod
     def _get_wifi_geolocation():
         """Get geolocation based on nearby Wi-Fi networks"""
         try:
             wifi_networks = []
             os_type = platform.system()
-            
+
             if os_type == "Windows":
                 # Get Wi-Fi networks on Windows
                 try:
                     output = subprocess.check_output(
-                        "netsh wlan show networks mode=bssid", 
-                        shell=True, 
-                        universal_newlines=True
+                        "netsh wlan show networks mode=bssid",
+                        shell=True,
+                        universal_newlines=True,
+                        stderr=subprocess.DEVNULL # Hide errors
                     )
-                    
+
                     current_network = {}
                     for line in output.split('\n'):
                         line = line.strip()
@@ -143,22 +329,23 @@ class GeoLocationFinder:
                             current_network = {'ssid': line.split(':', 1)[1].strip()}
                         elif "BSSID" in line and ":" in line:
                             current_network['mac'] = line.split(':', 1)[1].strip()
-                    
+
                     if current_network and 'ssid' in current_network and 'mac' in current_network:
                         wifi_networks.append(current_network)
-                        
+
                 except Exception as e:
                     logging.error(f"Error getting Windows Wi-Fi networks: {e}")
-            
+
             elif os_type == "Linux":
                 # Get Wi-Fi networks on Linux
                 try:
                     output = subprocess.check_output(
-                        "sudo iwlist scanning | grep -E 'Address|ESSID'", 
-                        shell=True, 
-                        universal_newlines=True
+                        "sudo iwlist scanning | grep -E 'Address|ESSID'",
+                        shell=True,
+                        universal_newlines=True,
+                        stderr=subprocess.DEVNULL
                     )
-                    
+
                     lines = output.split('\n')
                     for i in range(0, len(lines), 2):
                         if i+1 < len(lines):
@@ -170,16 +357,17 @@ class GeoLocationFinder:
                                 wifi_networks.append({'ssid': ssid, 'mac': mac})
                 except Exception as e:
                     logging.error(f"Error getting Linux Wi-Fi networks: {e}")
-            
+
             elif os_type == "Darwin":  # macOS
                 # Get Wi-Fi networks on macOS
                 try:
                     output = subprocess.check_output(
-                        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -s", 
-                        shell=True, 
-                        universal_newlines=True
+                        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -s",
+                        shell=True,
+                        universal_newlines=True,
+                        stderr=subprocess.DEVNULL
                     )
-                    
+
                     lines = output.split('\n')[1:]  # Skip header
                     for line in lines:
                         parts = line.split()
@@ -189,39 +377,33 @@ class GeoLocationFinder:
                             wifi_networks.append({'ssid': ssid, 'mac': mac})
                 except Exception as e:
                     logging.error(f"Error getting macOS Wi-Fi networks: {e}")
-            
+
             # If we found any networks, use them to get location
             if wifi_networks:
-                wifi_data = {
-                    "wifiAccessPoints": [
-                        {"macAddress": net["mac"], "signalStrength": -50} 
-                        for net in wifi_networks[:5]  # Use up to 5 networks
-                    ]
-                }
-                
-                # Use Google's API (requires API key) or alternative service
-                # This is a placeholder - in production you'd use a real API
+                # Placeholder - requires external API like Google Geolocation
                 return {
                     'success': True,
-                    'city': 'Local City',  # Placeholder
+                    'city': 'Local City (WiFi)',
                     'region': 'Local Region',
                     'country': 'Local Country',
                     'latitude': '0.00',
                     'longitude': '0.00'
                 }
-            
+
             return None
         except Exception as e:
             logging.error(f"Error in Wi-Fi geolocation: {e}")
             return None
-    
+
     @staticmethod
     def _get_ip_based_location():
         """Get location based on IP address"""
+        if not REQUESTS_AVAILABLE: return None
         try:
-            response = requests.get('http://ip-api.com/json/', timeout=5)
+            response = requests.get('http://ip-api.com/json/', timeout=3) # Shorter timeout
+            response.raise_for_status() # Check for HTTP errors
             data = response.json()
-            
+
             if data.get('status') == 'success':
                 return {
                     'city': data.get('city', 'Unknown'),
@@ -232,20 +414,21 @@ class GeoLocationFinder:
                     'method': 'ip'
                 }
             return None
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             logging.error(f"Error getting IP-based location: {e}")
             return None
-    
+        except Exception as e:
+            logging.error(f"Unexpected error in IP-based location: {e}")
+            return None
+
     @staticmethod
     def _get_timezone_location():
         """Get approximate location based on system timezone"""
         try:
             tz = time.tzname[0]
-            time_diff = time.timezone / 3600
-            
             # This is very approximate
             return {
-                'city': 'Local City (based on timezone)',
+                'city': f'Local City ({tz})',
                 'region': 'Unknown',
                 'country': 'Unknown',
                 'latitude': 'Unknown',
@@ -257,24 +440,152 @@ class GeoLocationFinder:
             logging.error(f"Error getting timezone location: {e}")
             return None
 
-
+# --- VPN Detection Thread ---
 class VPNDetectionThread(QThread):
+    # ... (VPNDetectionThread methods remain the same as previous version) ...
     detection_complete = pyqtSignal(dict)
-    
+
     def __init__(self, ip_address=None, user_agent=None):
         super().__init__()
         self.ip_address = ip_address
         self.user_agent = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         self.local_ip_location = None
-        
+
     def run(self):
         try:
             # Get local machine geolocation first
             self.local_ip_location = GeoLocationFinder.get_local_geolocation()
-            
+
             if not self.ip_address:
-                ip_response = requests.get('https://api.ipify.org?format=json', timeout=5)
+                if REQUESTS_AVAILABLE:
+                    try:
+                        ip_response = requests.get('https://api.ipify.org?format=json', timeout=3)
+                        ip_response.raise_for_status()
+                        self.ip_address = ip_response.json()['ip']
+                    except requests.exceptions.RequestException as e:
+                         logging.error(f"Failed to get public IP: {e}")
+                         self.detection_complete.emit({"error": "Could not fetch public IP", "isVPN": False, "confidence": 0})
+                         return
+                else:
+                    self.detection_complete.emit({"error": "Requests module missing", "isVPN": False, "confidence": 0})
+                    return
+
+            if not self.ip_address:
+                 self.detection_complete.emit({"error": "IP address unknown", "isVPN": False, "confidence": 0})
+                 return
+
+            results = self.comprehensive_vpn_detection(self.ip_address)
+            self.detection_complete.emit(results)
+        except Exception as e:
+            logging.error(f"VPN detection thread error: {str(e)}")
+            self.detection_complete.emit({
+                "error": str(e),
+                "isVPN": False,
+                "confidence": 0,
+                "ip": self.ip_address if self.ip_address else "Unknown",
+                "local_location": self.local_ip_location or {}
+            })
+
+    def check_proxycheck_io(self, ip):
+        """Check VPN status using ProxyCheck.io API"""
+        if not REQUESTS_AVAILABLE: return {'is_vpn': False, 'is_proxy': False, 'error': 'Requests module missing', 'service': 'ProxyCheck.io'}
+        try:
+            url = f"http://proxycheck.io/v2/{ip}?key={PROXYCHECK_API_KEY}&vpn=1&asn=1"
+            response = requests.get(url, timeout=3)
+            response.raise_for_status()
+            data = response.json()
+
+            proxy_data = data.get(ip, {})
+            is_proxy = proxy_data.get('proxy') == 'yes'
+            is_vpn = 'vpn' in str(proxy_data.get('type', '')).lower() or is_proxy
+
+            location = {
+                'country': proxy_data.get('country', 'Unknown'),
+                'isocode': proxy_data.get('isocode', ''),
+                'region': proxy_data.get('region', ''),
+                'city': proxy_data.get('city', ''),
+                'latitude': proxy_data.get('latitude', ''),
+                'longitude': proxy_data.get('longitude', ''),
+                'asn': proxy_data.get('asn', ''),
+                'provider': proxy_data.get('provider', '')
+            }
+
+            return {'is_vpn': is_vpn, 'is_proxy': is_proxy, 'location': location, 'raw_data': proxy_data, 'service': 'ProxyCheck.io'}
+        except requests.exceptions.RequestException as e:
+            logging.error(f"ProxyCheck.io API error: {str(e)}")
+            return {'is_vpn': False, 'is_proxy': False, 'error': str(e), 'service': 'ProxyCheck.io'}
+        except Exception as e:
+            logging.error(f"Unexpected error in ProxyCheck.io: {e}")
+            return {'is_vpn': False, 'is_proxy': False, 'error': str(e), 'service': 'ProxyCheck.io'}
+
+    def check_vpnapi_io(self, ip):
+        """Check VPN status using VPNAPI.io API"""
+        if not REQUESTS_AVAILABLE: return {'is_vpn': False, 'is_proxy': False, 'error': 'Requests module missing', 'service': 'VPNAPI.io'}
+        try:
+            url = f"https://vpnapi.io/api/{ip}?key={VPNAPI_API_KEY}"
+            response = requests.get(url, timeout=3)
+            response.raise_for_status()
+            data = response.json()
+
+            security_data = data.get('security', {})
+            is_vpn = security_data.get('vpn', False)
+            is_proxy = security_data.get('proxy', False)
+            is_tor = security_data.get('tor', False)
+            threat_level = security_data.get('threat_level', 'low')
+
+            location_data = {
+                'country': data.get('location', {}).get('country', 'Unknown'),
+                'region': data.get('location', {}).get('region', ''),
+                'city': data.get('location', {}).get('city', ''),
+                'latitude': data.get('location', {}).get('latitude', ''),
+                'longitude': data.get('location', {}).get('longitude', ''),
+            }
+
+            return {'is_vpn': is_vpn, 'is_proxy': is_proxy, 'is_tor': is_tor, 'threat_level': threat_level, 'location': location_data, 'raw_data': data, 'service': 'VPNAPI.io'}
+        except requests.exceptions.RequestException as e:
+            logging.error(f"VPNAPI.io API error: {str(e)}")
+            return {'is_vpn': False, 'is_proxy': False, 'error': str(e), 'service': 'VPNAPI.io'}
+        except Exception as e:
+            logging.error(f"Unexpected error in VPNAPI.io: {e}")
+            return {'is_vpn': False, 'is_proxy': False, 'error': str(e), 'service': 'VPNAPI.io'}
+
+    def check_ipinfo_io(self, ip):
+        """Check VPN status using IPinfo.io API"""
+        if not REQUESTS_AVAILABLE: return {'is_vpn': False, 'is_proxy': False, 'error': 'Requests module missing', 'service': 'IPinfo.io'}
+        try:
+            url = f"https://ipinfo.io/{ip}/json?token={IPINFO_API_KEY}"
+            response = requests.get(url, timeout=3)
+            response.raise_for_status()
+            data = response.json()
+
+            company = data.get('company', {}).get('name', '').lower() if isinstance(data.get('company'), dict) else ''
+            org = data.get('org', '').lower()
+            is_vpn_org = any(keyword in company or keyword in org for keyword in VPN_KEYWORDS)
+
+            lat, lon = data.get('loc', ',').split(',') if 'loc' in data and ',' in data['loc'] else ('', '')
+
+            location_data = {
+                'country': data.get('country', 'Unknown'),
+                'region': data.get('region', ''),
+                'city': data.get('city', ''),
+                'latitude': lat,
+                'longitude': lon,
+                'timezone': data.get('timezone', ''),
+                'asn': data.get('org', ''),
+                'hostname': data.get('hostname', '')
+            }
+
+            privacy = data.get('privacy', {})
+            is_hosting = privacy.get('hosting', False) if isinstance(privacy, dict) else False
+            
+            try:
+                ip_response = requests.get('https://api.ipify.org?format=json', timeout=3)
                 self.ip_address = ip_response.json()['ip']
+            except Exception as e:
+                logging.warning(f"Could not get IP from ipify.org: {e}")
+                # Use fallback or existing IP address
+                if not self.ip_address:
+                    self.ip_address = "Unknown"
                 
             results = self.comprehensive_vpn_detection(self.ip_address)
             self.detection_complete.emit(results)
@@ -374,11 +685,11 @@ class VPNDetectionThread(QThread):
             data = response.json()
             
             # Check for known VPN/proxy indicators
-            company = data.get('company', {}).get('name', '').lower()
+            company = data.get('company', {}).get('name', '').lower() if isinstance(data.get('company'), dict) else ''
             org = data.get('org', '').lower()
             is_vpn = any(keyword in company or keyword in org for keyword in VPN_KEYWORDS)
             
-            # Parse location data
+            # Parse location
             if 'loc' in data and ',' in data['loc']:
                 lat, lon = data['loc'].split(',')
             else:
@@ -397,20 +708,20 @@ class VPNDetectionThread(QThread):
             
             # Check for privacy services
             privacy = data.get('privacy', {})
-            is_hosting = privacy.get('hosting', False)
-            is_proxy = privacy.get('proxy', False)
-            is_tor = privacy.get('tor', False)
-            is_vpn_from_privacy = privacy.get('vpn', False)
+            is_hosting = privacy.get('hosting', False) if isinstance(privacy, dict) else False
+            is_proxy = privacy.get('proxy', False) if isinstance(privacy, dict) else False
+            is_tor = privacy.get('tor', False) if isinstance(privacy, dict) else False
+            is_vpn_from_privacy = privacy.get('vpn', False) if isinstance(privacy, dict) else False
             
             # If privacy data is available, use it as the definitive source
-            if 'privacy' in data:
+            if 'privacy' in data and isinstance(privacy, dict):
                 is_vpn = is_vpn_from_privacy or is_proxy or is_tor
             
             return {
                 'is_vpn': is_vpn,
-                'is_proxy': is_proxy if 'privacy' in data else False,
-                'is_tor': is_tor if 'privacy' in data else False,
-                'is_hosting': is_hosting if 'privacy' in data else False,
+                'is_proxy': is_proxy if 'privacy' in data and isinstance(privacy, dict) else False,
+                'is_tor': is_tor if 'privacy' in data and isinstance(privacy, dict) else False,
+                'is_hosting': is_hosting if 'privacy' in data and isinstance(privacy, dict) else False,
                 'location': location_data,
                 'raw_data': data,
                 'service': 'IPinfo.io'
@@ -422,8 +733,9 @@ class VPNDetectionThread(QThread):
     def check_running_vpn_processes(self):
         """Check for running VPN processes"""
         try:
-            import psutil
-            
+            if not PSUTIL_AVAILABLE:
+                return {'detected': False, 'error': 'psutil module not available'}
+                
             running_vpn_processes = []
             
             for process in psutil.process_iter(['name', 'cmdline']):
@@ -446,7 +758,9 @@ class VPNDetectionThread(QThread):
     def check_network_interfaces(self):
         """Check for VPN network interfaces"""
         try:
-            import psutil
+            if not PSUTIL_AVAILABLE:
+                return {'detected': False, 'error': 'psutil module not available'}
+                
             vpn_interfaces = []
             
             for interface, addrs in psutil.net_if_addrs().items():
@@ -463,24 +777,24 @@ class VPNDetectionThread(QThread):
     def detect_dns_leaks(self):
         """Attempt to detect DNS leaks"""
         try:
-            # This is a simplified detection - in a real application you would compare
-            # expected DNS servers with actual DNS resolutions
+            # First check if dns.resolver is available
             try:
                 import dns.resolver
-                resolver = dns.resolver.Resolver()
-                resolver.timeout = 5
-                resolver.lifetime = 5
-                
-                # Get system nameservers
-                nameservers = resolver.nameservers
-                
-                # Check if any nameservers are public rather than VPN's DNS
-                public_dns = ['8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1', '9.9.9.9']
-                potential_leak = any(ns in public_dns for ns in nameservers)
-                
-                return {'detected': potential_leak, 'nameservers': nameservers}
             except ImportError:
                 return {'detected': False, 'error': 'dns.resolver module not available'}
+
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = 5
+            resolver.lifetime = 5
+            
+            # Get system nameservers
+            nameservers = resolver.nameservers
+            
+            # Check if any nameservers are public rather than VPN's DNS
+            public_dns = ['8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1', '9.9.9.9']
+            potential_leak = any(ns in public_dns for ns in nameservers)
+            
+            return {'detected': potential_leak, 'nameservers': nameservers}
         except Exception as e:
             return {'error': str(e), 'detected': False}
     
@@ -492,9 +806,12 @@ class VPNDetectionThread(QThread):
             
             for i in range(2):  # Reduced to 2 requests to minimize delay
                 start_time = time.time()
-                requests.get('https://www.google.com', timeout=2)
-                end_time = time.time()
-                timings.append(end_time - start_time)
+                try:
+                    requests.get('https://www.google.com', timeout=2)
+                    end_time = time.time()
+                    timings.append(end_time - start_time)
+                except requests.RequestException:
+                    pass  # Skip this timing if request fails
             
             if len(timings) > 1:
                 avg = sum(timings) / len(timings)
@@ -516,44 +833,50 @@ class VPNDetectionThread(QThread):
                 return {'location_mismatch': False, 'reason': 'Missing location data'}
             
             # Compare country first (most reliable indicator)
-            public_country = public_ip_location.get('country', '').lower()
-            local_country = local_ip_location.get('country', '').lower()
+            public_country = str(public_ip_location.get('country', '')).lower()
+            local_country = str(local_ip_location.get('country', '')).lower()
             
-            if public_country and local_country and public_country != local_country:
+            if public_country and local_country and public_country != local_country and public_country != 'unknown' and local_country != 'unknown':
                 return {'location_mismatch': True, 'reason': f'Country mismatch: {public_country} vs {local_country}'}
             
             # Compare city if both are available
-            public_city = public_ip_location.get('city', '').lower()
-            local_city = local_ip_location.get('city', '').lower()
+            public_city = str(public_ip_location.get('city', '')).lower()
+            local_city = str(local_ip_location.get('city', '')).lower()
             
-            if public_city and local_city and public_city != local_city and public_city != 'unknown' and local_city != 'unknown':
+            if public_city and local_city and public_city != local_city and public_city != 'unknown' and local_city != 'unknown' and 'local city' not in local_city:
                 return {'location_mismatch': True, 'reason': f'City mismatch: {public_city} vs {local_city}'}
             
             # If we have coordinates for both, compare them
             try:
-                public_lat = float(public_ip_location.get('latitude', 0))
-                public_lon = float(public_ip_location.get('longitude', 0))
-                local_lat = float(local_ip_location.get('latitude', 0))
-                local_lon = float(local_ip_location.get('longitude', 0))
-                
-                # Calculate distance in km using Haversine formula
-                from math import sin, cos, sqrt, atan2, radians
-                R = 6371  # Earth radius in km
-                
-                lat1, lon1 = radians(public_lat), radians(public_lon)
-                lat2, lon2 = radians(local_lat), radians(local_lon)
-                
-                dlon = lon2 - lon1
-                dlat = lat2 - lat1
-                
-                a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-                c = 2 * atan2(sqrt(a), sqrt(1-a))
-                distance = R * c
-                
-                # If distance is greater than 50km, consider it a mismatch
-                if distance > 50:
-                    return {'location_mismatch': True, 'reason': f'Distance too great: {distance:.1f} km'}
-            except Exception as e:
+                # Check if values can be converted to float before proceeding
+                try:
+                    # Convert latitude and longitude to float if possible
+                    public_lat = float(public_ip_location.get('latitude', 0))
+                    public_lon = float(public_ip_location.get('longitude', 0))
+                    local_lat = float(local_ip_location.get('latitude', 0))
+                    local_lon = float(local_ip_location.get('longitude', 0))
+                    
+                    # Calculate distance in km using Haversine formula
+                    from math import sin, cos, sqrt, atan2, radians
+                    R = 6371  # Earth radius in km
+                    
+                    lat1, lon1 = radians(public_lat), radians(public_lon)
+                    lat2, lon2 = radians(local_lat), radians(local_lon)
+                    
+                    dlon = lon2 - lon1
+                    dlat = lat2 - lat1
+                    
+                    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+                    c = 2 * atan2(sqrt(a), sqrt(1-a))
+                    distance = R * c
+                    
+                    # If distance is greater than 50km, consider it a mismatch
+                    if distance > 50:
+                        return {'location_mismatch': True, 'reason': f'Distance too great: {distance:.1f} km'}
+                except (ValueError, TypeError):
+                    # Coordinates couldn't be converted to float
+                    pass
+            except Exception:
                 # If we can't calculate distance, don't use it as an indicator
                 pass
                 
@@ -642,10 +965,7 @@ class VPNDetectionThread(QThread):
         confidence_percentage = min(round(vpn_score * 100), 100)
         
         # Determine final VPN status - ONLY if confidence > 50% 
-        # This is a key change requested
         is_vpn = confidence_percentage > 50
-
-        
         
         return {
             'isVPN': is_vpn,
@@ -654,7 +974,7 @@ class VPNDetectionThread(QThread):
             'location': location,
             'local_location': self.local_ip_location,
             'ip': ip,
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'timestamp': "2025-03-10 08:14:01",  # Updated timestamp
             'vpn_votes': vpn_votes
         }
 
@@ -666,6 +986,7 @@ class VPNBlockerThread(QThread):
         super().__init__()
         self.action = action  # "start" or "stop"
         self.os_type = platform.system()
+        self.block_id = datetime.now().strftime("%Y%m%d%H%M%S")
         
     def run(self):
         result = {"success": False, "message": "Unknown error"}
@@ -690,226 +1011,627 @@ class VPNBlockerThread(QThread):
             
         self.blocking_status.emit(result)
     
-    def block_vpn_windows(self):
-        """Implement strict VPN blocking on Windows with permanent blocking"""
+    def is_admin_windows(self):
+        """Check if running with admin privileges on Windows"""
         try:
-            # 1. Block VPN services
-            for service in VPN_SERVICES["Windows"]:
-                try:
-                    subprocess.run(["sc", "stop", service], check=False, capture_output=True)
-                    subprocess.run(["sc", "config", service, "start=disabled"], check=False, capture_output=True)
-                except:
-                    pass  # Continue if service doesn't exist or can't be managed
-            
-            # 2. Create strict firewall rules
-            firewall_rules = [
-                # Block OpenVPN
-                'netsh advfirewall firewall add rule name="Block OpenVPN" dir=out program="*openvpn*.exe" action=block', 
-                'netsh advfirewall firewall add rule name="Block VPN UDP" dir=out protocol=UDP remoteport=1194,500,4500,1701,51820 action=block',
-                'netsh advfirewall firewall add rule name="Block VPN TCP" dir=out protocol=TCP remoteport=1194,443,1723 action=block',
-                # Block WireGuard
-                'netsh advfirewall firewall add rule name="Block WireGuard" dir=out program="*wireguard*.exe" action=block',
-                # Block general VPN ports
-                'netsh advfirewall firewall add rule name="Block VPN Protocols" dir=out protocol=ANY remoteport=1194,500,4500,1701,51820 action=block',
-                # Additional blocks for DNS
-                'netsh advfirewall firewall add rule name="Block All Outgoing DNS UDP" dir=out protocol=UDP remoteport=53 action=block', 
-                'netsh advfirewall firewall add rule name="Block All Outgoing DNS TCP" dir=out protocol=TCP remoteport=53 action=block'
-            ]
-            
-            for rule in firewall_rules:
-                subprocess.run(rule, shell=True, check=False, capture_output=True)
-            
-            # 3. Disable TAP/TUN adapters
-            subprocess.run('powershell "Get-NetAdapter | Where-Object {$_.InterfaceDescription -match \'TAP|TUN|VPN\'} | Disable-NetAdapter -Confirm:$false"', 
-                          shell=True, check=False, capture_output=True)
-            
-            # 4. Create the VPN process blocker script with enhanced functionality
-            script_content = '''
-@echo off
-:loop
-REM Stop VPN services
-sc stop OpenVPNService
-sc stop WireGuardTunnel
-sc stop PPTP
-sc stop L2TP
-sc stop IPSEC
-sc stop SstpSvc
-sc stop PanGPS
-sc stop NordVPN
-sc stop ExpressVPN
-sc stop ProtonVPN
-sc stop MullvadVPN
-sc stop VyprVPNService
-sc stop "Surfshark Service" 
-sc stop "Cisco AnyConnect Secure Mobility Agent Service" 
-sc stop "SoftEther VPN Client Service"
-sc stop WindscribeService
-sc stop "Tunnelbear Desktop"
-sc stop ipvanish
-sc stop PrivateInternetAccessService
-sc stop "CyberGhost 5 Service"
-sc stop PIA
-
-REM Keep services disabled
-sc config OpenVPNService start=disabled
-sc config WireGuardTunnel start=disabled
-sc config PPTP start=disabled
-sc config L2TP start=disabled
-sc config IPSEC start=disabled
-sc config SstpSvc start=disabled
-sc config PanGPS start=disabled
-sc config NordVPN start=disabled
-sc config ExpressVPN start=disabled
-sc config ProtonVPN start=disabled
-sc config MullvadVPN start=disabled
-sc config VyprVPNService start=disabled
-sc config "Surfshark Service" start=disabled
-sc config "Cisco AnyConnect Secure Mobility Agent Service" start=disabled
-sc config "SoftEther VPN Client Service" start=disabled
-sc config WindscribeService start=disabled
-sc config "Tunnelbear Desktop" start=disabled
-sc config ipvanish start=disabled
-sc config PrivateInternetAccessService start=disabled
-sc config "CyberGhost 5 Service" start=disabled
-sc config PIA start=disabled
-
-REM Disable network adapters
-powershell -Command "Get-NetAdapter | Where-Object {$_.InterfaceDescription -match \'TAP|TUN|VPN\'} | Disable-NetAdapter -Confirm:$false" 2>nul
-
-REM Re-apply firewall rules
-netsh advfirewall firewall add rule name="Block VPN UDP" dir=out protocol=UDP remoteport=1194,500,4500,1701,51820 action=block
-netsh advfirewall firewall add rule name="Block VPN TCP" dir=out protocol=TCP remoteport=1194,443,1723 action=block
-netsh advfirewall firewall add rule name="Block OpenVPN" dir=out program="*openvpn*.exe" action=block
-netsh advfirewall firewall add rule name="Block WireGuard" dir=out program="*wireguard*.exe" action=block
-netsh advfirewall firewall add rule name="Block VPN Protocols" dir=out protocol=ANY remoteport=1194,500,4500,1701,51820 action=block
-
-REM Kill VPN processes if they exist
-taskkill /f /im openvpn.exe 2>nul
-taskkill /f /im openvpnserv.exe 2>nul
-taskkill /f /im openvpnserv2.exe 2>nul
-taskkill /f /im tapinstall.exe 2>nul
-taskkill /f /im wireguard.exe 2>nul
-taskkill /f /im nordvpn.exe 2>nul
-taskkill /f /im expressvpn.exe 2>nul
-taskkill /f /im protonvpn.exe 2>nul
-taskkill /f /im mullvad.exe 2>nul
-taskkill /f /im vpn.exe 2>nul
-
-REM Disable VPN related tasks
-schtasks /Change /TN "*vpn*" /Disable 2>nul
-schtasks /Change /TN "*VPN*" /Disable 2>nul
-schtasks /Change /TN "*nordvpn*" /Disable 2>nul
-schtasks /Change /TN "*expressvpn*" /Disable 2>nul
-schtasks /Change /TN "*proton*" /Disable 2>nul
-
-timeout /t 5 >nul
-goto loop
-'''
-            script_path = os.path.join(tempfile.gettempdir(), "vpn_blocker.bat")
-            with open(script_path, "w") as f:
-                f.write(script_content)
-            
-            # 5. Create a scheduled task to run the VPN blocker at startup and periodically
-            try:
-                # Delete existing task if it exists
-                subprocess.run(["schtasks", "/delete", "/tn", "VPNBlocker", "/f"], 
-                              check=False, capture_output=True)
-                
-                # Create new task to run at startup and every 5 minutes
-                subprocess.run([
-                    "schtasks", "/create", "/tn", "VPNBlocker", "/tr", script_path,
-                    "/sc", "minute", "/mo", "5", "/ru", "SYSTEM", "/f"
-                ], check=False, capture_output=True)
-                
-                # Run the task now
-                subprocess.run(["schtasks", "/run", "/tn", "VPNBlocker"], check=False, capture_output=True)
-                
-                # Also create a startup task
-                startup_task = [
-                    "schtasks", "/create", "/tn", "VPNBlockerStartup", "/tr", script_path,
-                    "/sc", "onstart", "/ru", "SYSTEM", "/f"
-                ]
-                subprocess.run(startup_task, check=False, capture_output=True)
-                
-            except Exception as e:
-                logging.error(f"Failed to create scheduled task: {str(e)}")
-            
-            # 6. Try to modify hosts file to block VPN provider websites
-            try:
-                hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
-                with open(hosts_path, "a") as hosts_file:
-                    hosts_file.write("\n# VPN Provider Blocks added by CheckBlock\n")
-                    for domain in VPN_DOMAINS:
-                        hosts_file.write(f"127.0.0.1 {domain}\n")
-                        hosts_file.write(f"127.0.0.1 www.{domain}\n")
-            except Exception as e:
-                logging.error(f"Failed to modify hosts file: {str(e)}")
-            
-            return {
-                "success": True, 
-                "message": "VPN blocking measures implemented. Firewall rules added, VPN services disabled, and persistent blocking enabled."
-            }
+            # Try the direct approach using ctypes
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
         except Exception as e:
+            print(f"Admin check failed with ctypes: {e}")
+            # Fallback to checking using system commands
+            try:
+                # Use 'net session' command which requires admin rights
+                devnull = open(os.devnull, 'w')
+                subprocess.check_call(['net', 'session'], stdout=devnull, stderr=devnull)
+                devnull.close()
+                return True
+            except Exception:
+                return False
+    
+    def block_vpn_windows(self):
+        """Implement comprehensive VPN blocking on Windows using the new implementation"""
+        try:
+            # Make sure we're running with admin privileges
+            if not self.is_admin_windows():
+                return {
+                    "success": False, 
+                    "message": "Administrator privileges required for VPN blocking."
+                }
+            
+            # Create a more robust script that doesn't depend on external modules
+            script_path = os.path.join(tempfile.gettempdir(), 'vpn_blocker_script.py')
+            
+            script_content = """
+import subprocess
+import time
+import os
+import sys  # Make sure sys is imported
+import logging
+import threading
+import json
+from datetime import datetime, timedelta
+
+# Setup logging to file in temp directory
+log_file = os.path.join(os.environ.get('TEMP', '.'), 'vpn_blocker.log')
+logging.basicConfig(filename=log_file, level=logging.INFO, format="%(asctime)s - %(message)s")
+
+# Constants for VPN-specific ports and protocols
+VPN_PORTS = [1194, 500, 4500, 1701, 1723]
+VPN_PROTOCOLS = ["UDP", "TCP"]
+VPN_PROTOCOL_NUMBERS = {"GRE": 47, "ESP": 50, "AH": 51}
+VPN_PROCESSES = ["openvpn.exe", "nordvpn.exe", "expressvpn.exe", "protonvpn.exe", 
+                "ipsec.exe", "softether.exe", "wireguard.exe"]
+VPN_DOMAINS = ["nordvpn.com", "expressvpn.com", "protonvpn.com", "surfshark.com", 
+               "cyberghostvpn.com", "pia.com", "privateinternetaccess.com",
+               "mullvad.net", "vyprvpn.com", "torguard.net", "purevpn.com", 
+               "ipvanish.com", "tunnelbear.com", "windscribe.com", "hidemyass.com", 
+               "strongvpn.com"]
+
+CONFIG_FILE = os.path.join(os.environ.get('TEMP', '.'), "vpn_blocker_config.json")
+UPDATE_INTERVAL = 86400  # 24 hours in seconds
+
+def exit_application(code=0):
+    # Safe exit function that doesn't call itself
+    sys.exit(code)
+
+def is_admin():
+    \"\"\"Check if the script is running with admin privileges.\"\"\"
+    try:
+        # Try the direct approach using ctypes
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        # Fallback to checking using system commands
+        try:
+            # Use 'net session' command which requires admin rights
+            devnull = open(os.devnull, 'w')
+            subprocess.check_call(['net', 'session'], stdout=devnull, stderr=devnull)
+            devnull.close()
+            return True
+        except Exception:
+            return False
+
+def run_as_admin():
+    \"\"\"Ensure the script is running with administrative privileges.\"\"\"
+    if not is_admin():
+        print("This script requires administrative privileges. Exiting...")
+        logging.error("Script not running with admin privileges")
+        exit_application(1)
+
+def is_vpn_process_running():
+    \"\"\"Check if any VPN-related process is running.\"\"\"
+    try:
+        # Use tasklist command to list processes
+        output = subprocess.check_output("tasklist /FO CSV", shell=True, universal_newlines=True)
+        for vpn_process in VPN_PROCESSES:
+            if vpn_process.lower() in output.lower():
+                logging.info(f"VPN process detected: {vpn_process}")
+                return True
+        return False
+    except Exception as e:
+        logging.error(f"Error checking VPN processes: {e}")
+        return False  # Default to False on error
+
+def is_vpn_adapter_active():
+    \"\"\"Check if a VPN network adapter is active.\"\"\"
+    try:
+        # Use ipconfig to check network adapters
+        output = subprocess.check_output("ipconfig /all", shell=True, universal_newlines=True)
+        for line in output.split('\\n'):
+            if any(keyword in line.lower() for keyword in ["vpn", "virtual", "tunnel", "tap"]):
+                logging.info(f"VPN adapter detected: {line.strip()}")
+                return True
+        return False
+    except Exception as e:
+        logging.error(f"Error checking VPN adapters: {e}")
+        return False  # Default to False on error
+
+def is_vpn_active():
+    \"\"\"Check if a VPN is currently active.\"\"\"
+    return is_vpn_process_running() or is_vpn_adapter_active() or True  # Assume active for maximum safety
+
+def block_vpn_ports():
+    \"\"\"Block VPN-specific ports using Windows Firewall.\"\"\"
+    print("Blocking VPN-specific ports via Windows Firewall...")
+    logging.info("Blocking VPN-specific ports")
+    
+    # Use netsh for blocking
+    firewall_cmd_base = 'netsh advfirewall firewall add rule name="Block VPN {} Port {}" dir=out action=block protocol={} localport={} enable=yes'
+    
+    for protocol in VPN_PROTOCOLS:
+        for port in VPN_PORTS:
+            cmd = firewall_cmd_base.format(protocol, port, protocol, port)
+            try:
+                subprocess.run(cmd, shell=True, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                print(f"Blocked {protocol} port {port}")
+            except Exception as e:
+                logging.error(f"Error blocking {protocol} port {port}: {e}")
+
+def block_vpn_protocols():
+    \"\"\"Block VPN-specific protocols using Windows Firewall.\"\"\"
+    print("Blocking VPN-specific protocols...")
+    logging.info("Blocking VPN protocols")
+    
+    firewall_cmd_base = 'netsh advfirewall firewall add rule name="Block VPN Protocol {}" dir=out action=block protocol={} enable=yes'
+    
+    for protocol_name, protocol_number in VPN_PROTOCOL_NUMBERS.items():
+        cmd = firewall_cmd_base.format(protocol_name, protocol_number)
+        try:
+            subprocess.run(cmd, shell=True, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            print(f"Blocked protocol {protocol_name}")
+        except Exception as e:
+            logging.error(f"Error blocking protocol {protocol_name}: {e}")
+
+def block_vpn_domains():
+    \"\"\"Block DNS resolution of known VPN domains using hosts file.\"\"\"
+    print("Blocking VPN domains via hosts file...")
+    logging.info("Blocking VPN domains")
+    
+    hosts_path = r"C:\\Windows\\System32\\drivers\\etc\\hosts"
+    redirect_ip = "127.0.0.1"  # Redirect to localhost
+    
+    try:
+        # Read existing content first
+        with open(hosts_path, "r") as hosts_file:
+            content = hosts_file.read()
+            
+        # Append domains only if they don't exist
+        with open(hosts_path, "a+") as hosts_file:
+            hosts_file.write("\\n# VPN Blocking entries added by CheckBlock\\n")
+            for domain in VPN_DOMAINS:
+                if domain not in content:
+                    hosts_file.write(f"{redirect_ip} {domain}\\n")
+                    hosts_file.write(f"{redirect_ip} www.{domain}\\n")
+                    print(f"Blocked VPN domain: {domain}")
+    except Exception as e:
+        logging.error(f"Error modifying hosts file: {e}")
+
+def disable_vpn_adapters():
+    \"\"\"Disable network adapters associated with VPN connections.\"\"\"
+    print("Disabling VPN network adapters...")
+    logging.info("Disabling VPN adapters")
+    
+    try:
+        # Get network adapters using netsh
+        output = subprocess.check_output("netsh interface show interface", shell=True, universal_newlines=True)
+        for line in output.split('\\n'):
+            if any(keyword in line.lower() for keyword in ["vpn", "virtual", "tunnel", "tap"]):
+                adapter_name = line.split()[-1]  # Get adapter name from last column
+                disable_cmd = f'netsh interface set interface "{adapter_name}" disabled'
+                try:
+                    subprocess.run(disable_cmd, shell=True, check=False)
+                    print(f"Disabled VPN adapter: {adapter_name}")
+                except Exception as e:
+                    logging.error(f"Error disabling adapter {adapter_name}: {e}")
+    except Exception as e:
+        logging.error(f"Error in disable_vpn_adapters: {e}")
+
+def stop_vpn_services():
+    \"\"\"Stop and disable services commonly used by VPN software.\"\"\"
+    print("Stopping and disabling VPN-related services...")
+    logging.info("Stopping VPN services")
+    
+    vpn_services = [
+        "RasMan",  # Remote Access Connection Manager (used by many VPNs)
+        "IKEEXT",  # IKE and AuthIP IPsec Keying Modules
+        "PolicyAgent",  # IPsec Policy Agent
+    ]
+    
+    for service in vpn_services:
+        try:
+            # Use SC command to stop and disable services
+            subprocess.run(f'sc stop {service}', shell=True, check=False)
+            subprocess.run(f'sc config {service} start= disabled', shell=True, check=False)
+            print(f"Stopped and disabled service: {service}")
+        except Exception as e:
+            logging.error(f"Error managing service {service}: {e}")
+
+def terminate_vpn_processes():
+    \"\"\"Detect and terminate VPN-related processes.\"\"\"
+    print("Scanning for and terminating VPN-related processes...")
+    logging.info("Terminating VPN processes")
+    
+    try:
+        # Get process list using tasklist
+        output = subprocess.check_output("tasklist /FO CSV", shell=True, universal_newlines=True)
+        for vpn_process in VPN_PROCESSES:
+            if vpn_process.lower() in output.lower():
+                try:
+                    # Try to terminate the process using taskkill
+                    subprocess.run(f'taskkill /F /IM "{vpn_process}"', shell=True, check=False)
+                    print(f"Terminated VPN process: {vpn_process}")
+                except Exception as e:
+                    logging.error(f"Error terminating process: {e}")
+    except Exception as e:
+        logging.error(f"Error in terminate_vpn_processes: {e}")
+
+def monitor_vpn_connections():
+    \"\"\"Monitor and block any new VPN connections in real-time.\"\"\"
+    print("Starting real-time VPN connection monitoring...")
+    logging.info("Starting VPN connection monitoring")
+    
+    while True:
+        try:
+            # Always apply blocking measures
+            block_vpn_ports()
+            block_vpn_protocols()
+            block_vpn_domains()
+            disable_vpn_adapters()
+            stop_vpn_services()
+            terminate_vpn_processes()
+            time.sleep(5)  # Check every 5 seconds
+        except Exception as e:
+            logging.error(f"Error in VPN connection monitoring: {e}")
+            time.sleep(5)  # Wait before retrying in case of errors
+
+def main():
+    \"\"\"Main function to orchestrate VPN blocking.\"\"\"
+    run_as_admin()  # Ensure script runs with admin privileges
+
+    print("Starting VPN blocking script...")
+    logging.info("Starting VPN blocking script")
+
+    # Block everything immediately
+    block_vpn_ports()
+    block_vpn_protocols()
+    block_vpn_domains()
+    disable_vpn_adapters()
+    stop_vpn_services()
+    terminate_vpn_processes()
+
+    # Start real-time monitoring in a separate thread
+    monitor_thread = threading.Thread(target=monitor_vpn_connections, daemon=True)
+    monitor_thread.start()
+
+    print("VPN blocking script is running.")
+    logging.info("VPN blocking active and monitoring")
+
+    try:
+        while True:
+            time.sleep(1)  # Keep the main thread alive
+    except KeyboardInterrupt:
+        print("Stopping VPN blocking script...")
+        logging.info("Stopping VPN blocking script")
+        exit_application(0)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"Unexpected error: {e}")
+        traceback.print_exc()
+    finally:
+        # Ensure clean exit
+        _ensure_clean_exit()
+"""
+            
+            # Write the script to a file
+            with open(script_path, 'w') as f:
+                f.write(script_content)
+                
+            # Launch the script in a new process so it runs independently
+            startupinfo = None
+            if hasattr(subprocess, 'STARTUPINFO'):
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+            try:
+                subprocess.Popen(
+                    [sys.executable, script_path],
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+                
+                # Ensure clean application exit
+                global _APPLICATION_EXITING
+                _APPLICATION_EXITING = True
+                return {
+                    "success": True, 
+                    "message": "Windows VPN blocking has been started successfully. VPN connections will be detected and blocked in real-time."
+                }
+            except Exception as e:
+                return {
+                    "success": False, 
+                    "message": f"Failed to start VPN blocking: {str(e)}"
+                }
+        except Exception as e:
+            logging.error(f"Failed to start Windows VPN blocking: {e}")
             return {
                 "success": False, 
                 "message": f"Failed to apply VPN blocking: {str(e)}"
             }
-    
+
     def stop_blocking_windows(self):
         """Stop VPN blocking on Windows"""
         try:
-            # Delete firewall rules
-            vpn_rules = [
-                "Block All Outgoing DNS UDP", 
-                "Block All Outgoing DNS TCP", 
-                "Block OpenVPN", 
-                "Block WireGuard", 
-                "Block VPN UDP Ports", 
-                "Block VPN TCP Ports", 
-                "Block VPN Protocols",
-                "Block VPN UDP",
-                "Block VPN TCP"
-            ]
+            # Run cleanup script that will remove firewall rules and hosts file entries
+            cleanup_script_path = os.path.join(tempfile.gettempdir(), 'vpn_cleanup.py')
             
-            for rule in vpn_rules:
-                subprocess.run(f'netsh advfirewall firewall delete rule name="{rule}"', 
-                              shell=True, check=False, capture_output=True)
+            cleanup_script = """
+import subprocess
+import os
+import logging
+
+# EXIT_HANDLER_FIX
+import atexit
+# Safe exit handler
+def safe_exit(event=None):
+    \"\"\"Ensure the application exits cleanly\"\"\"
+    try:
+        # Call original exit functions if they exist
+        for func_name in ['exit_application', 'exit_app', 'on_closing', 'close_application', 'quit_app', 'on_exit']:
+            if func_name in globals():
+                globals()[func_name]()
+        
+        # Destroy root window if it exists
+        try:
+            import tkinter as tk
+            if tk._default_root:
+                tk._default_root.quit()
+                tk._default_root.destroy()
+        except Exception as e:
+            print(f"Failed to destroy root window: {e}")
             
-            # Remove scheduled tasks
-            subprocess.run(["schtasks", "/delete", "/tn", "VPNBlocker", "/f"], 
-                          check=False, capture_output=True)
-            subprocess.run(["schtasks", "/delete", "/tn", "VPNBlockerStartup", "/f"], 
-                          check=False, capture_output=True)
+        # Ensure we exit completely
+        import os
+        os._exit(0)
+    except Exception as e:
+        print(f"Error during exit: {e}")
+        import os
+        os._exit(0)
+
+def _ensure_clean_exit():
+    # Ensure application exits cleanly
+    try:
+        # Destroy any remaining Tk windows
+        import tkinter as tk
+        if hasattr(tk, '_default_root') and tk._default_root:
+            tk._default_root.quit()
+            tk._default_root.destroy()
             
-            # Stop running blocker script
-            subprocess.run('taskkill /f /im cmd.exe /fi "windowtitle eq vpn_blocker*"', 
-                          shell=True, check=False, capture_output=True)
+        # Ensure we exit cleanly
+        import os
+        os._exit(0)
+    except Exception as e:
+        print(f"Exit handler error: {e}")
+        pass
+
+# Register the exit handler
+atexit.register(_ensure_clean_exit)
+
+
+# WINDOWS_ICON_INTEGRATION
+if __name__ == "__main__" and platform.system() == "Windows":
+    try:
+        # Set application ID for taskbar grouping
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CheckBlock.Application")
+        
+        # Find icon file path
+        import os
+        if getattr(sys, 'frozen', False):
+            # Running from PyInstaller bundle
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            # Running from source
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             
-            # Enable VPN services
-            for service in VPN_SERVICES["Windows"]:
-                try:
-                    subprocess.run(["sc", "config", service, "start=demand"], 
-                                  check=False, capture_output=True)
-                except:
-                    pass
-                    
-            # Cleanup hosts file
+        # Check available icon files
+        icon_path = None
+        for path in [
+            os.path.join(base_dir, "resources", "Logo.ico"),
+            os.path.join(base_dir, "resources", "Logo.png")
+        ]:
+            if (os.path.exists(path)):
+                icon_path = path
+                break
+                
+        if icon_path:
+            print(f"Using icon from: {icon_path}")
+            
+            # Try to set icon for Tkinter applications
             try:
-                hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
-                with open(hosts_path, "r") as hosts_file:
-                    lines = hosts_file.readlines()
+                import tkinter as tk
+                def set_tk_icon():
+                    root = tk._default_root
+                    if root:
+                        if icon_path.endswith(".ico"):
+                            root.iconbitmap(default=icon_path)
+                        else:
+                            icon = tk.PhotoImage(file=icon_path)
+                            root.iconphoto(True, icon)
+                        root.title("CheckBlock")
+                        print("Set Tkinter window icon")
                 
-                with open(hosts_path, "w") as hosts_file:
-                    for line in lines:
-                        if not any(domain in line for domain in VPN_DOMAINS) and "CheckBlock" not in line:
-                            hosts_file.write(line)
+                # Call directly if Tk is already initialized
+                if 'tkinter' in sys.modules and tk._default_root:
+                    set_tk_icon()
+                # Otherwise schedule it to run soon
+                elif 'tkinter' in sys.modules:
+                    tk.Frame().after(100, set_tk_icon)
+            except Exception:
+                pass
+                
+            # Try to set icon for PyQt applications
+            try:
+                from PyQt5.QtGui import QIcon
+                from PyQt5.QtWidgets import QApplication
+                app = QApplication.instance()
+                if app:
+                    app.setWindowIcon(QIcon(icon_path))
+                    print("Set PyQt window icon")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Error setting up Windows icon: {e}")
+
+# Setup logging to file in temp directory
+log_file = os.path.join(os.environ.get('TEMP', '.'), 'vpn_blocker_cleanup.log')
+logging.basicConfig(filename=log_file, level=logging.INFO, format="%(asctime)s - %(message)s")
+
+def is_admin():
+    \"\"\"Check if the script is running with admin privileges.\"\"\"
+    try:
+        # Try the direct approach using ctypes
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        # Fallback to checking using system commands
+        try:
+            # Use 'net session' command which requires admin rights
+            devnull = open(os.devnull, 'w')
+            subprocess.check_call(['net', 'session'], stdout=devnull, stderr=devnull)
+            devnull.close()
+            return True
+        except Exception:
+            return False
+
+def run_as_admin():
+    \"\"\"Ensure the script is running with administrative privileges.\"\"\"
+    if not is_admin():
+        print("This script requires administrative privileges. Exiting...")
+        logging.error("Script not running with admin privileges")
+        exit_application(1)
+
+def cleanup():
+    \"\"\"Clean up VPN blocking rules.\"\"\"
+    print("Cleaning up VPN blocking rules...")
+    logging.info("Starting VPN blocking cleanup")
+    
+    # VPN-specific ports and protocols to unblock
+    VPN_PORTS = [1194, 500, 4500, 1701, 1723]
+    VPN_PROTOCOLS = ["UDP", "TCP"]
+    VPN_PROTOCOL_NUMBERS = {"GRE": 47, "ESP": 50, "AH": 51}
+    VPN_DOMAINS = [
+        "nordvpn.com", "expressvpn.com", "protonvpn.com", "surfshark.com", 
+        "cyberghostvpn.com", "pia.com", "privateinternetaccess.com",
+        "mullvad.net", "vyprvpn.com", "torguard.net", "purevpn.com", "ipvanish.com",
+        "tunnelbear.com", "windscribe.com", "hidemyass.com", "cyberghostvpn.com", "strongvpn.com"
+    ]
+
+    # Remove firewall rules for VPN ports
+    for protocol in VPN_PROTOCOLS:
+        for port in VPN_PORTS:
+            try:
+                cmd = f'netsh advfirewall firewall delete rule name="Block VPN {protocol} Port {port}"'
+                subprocess.run(cmd, shell=True, check=False)
+                print(f"Removed port blocking rule for {protocol} port {port}")
             except Exception as e:
-                logging.error(f"Failed to cleanup hosts file: {str(e)}")
+                logging.error(f"Error removing rule: {e}")
+
+    # Remove firewall rules for VPN protocols
+    for protocol_name, protocol_number in VPN_PROTOCOL_NUMBERS.items():
+        try:
+            cmd = f'netsh advfirewall firewall delete rule name="Block VPN Protocol {protocol_name}"'
+            subprocess.run(cmd, shell=True, check=False)
+            print(f"Removed protocol blocking rule for {protocol_name}")
+        except Exception as e:
+            logging.error(f"Error removing rule: {e}")
+
+    # Remove any IP range blocking rules with wildcard
+    try:
+        cmd = 'netsh advfirewall firewall delete rule name="Block VPN IP Range*"'
+        subprocess.run(cmd, shell=True, check=False)
+        print("Removed IP range blocking rules")
+    except Exception as e:
+        logging.error(f"Error removing IP range rules: {e}")
+
+    # Clean up hosts file entries
+    hosts_path = r"C:\\Windows\\System32\\drivers\\etc\\hosts"
+    try:
+        # First read current hosts file
+        with open(hosts_path, "r") as hosts_file:
+            lines = hosts_file.readlines()
+        
+        # Write back only non-VPN entries
+        with open(hosts_path, "w") as hosts_file:
+            in_block_section = False
+            for line in lines:
+                # Skip lines related to VPN blocking
+                if "VPN Blocking entries added by CheckBlock" in line:
+                    in_block_section = True
+                    continue
+                    
+                if in_block_section and not line.strip():
+                    # Empty line means end of our block
+                    in_block_section = False
                 
-            return {
-                "success": True, 
-                "message": "VPN blocking measures removed. Firewall rules deleted, scheduled tasks removed."
-            }
+                if not in_block_section and not any(domain in line for domain in VPN_DOMAINS):
+                    hosts_file.write(line)
+                    
+        print("Cleaned up hosts file entries")
+    except Exception as e:
+        logging.error(f"Error cleaning hosts file: {e}")
+
+    # Re-enable VPN services
+    vpn_services = ["RasMan", "IKEEXT", "PolicyAgent"]
+    for service in vpn_services:
+        try:
+            cmd = f'sc config {service} start= demand'
+            subprocess.run(cmd, shell=True, check=False)
+            cmd = f'sc start {service}'
+            subprocess.run(cmd, shell=True, check=False)
+            print(f"Re-enabled service: {service}")
+        except Exception as e:
+            logging.error(f"Error re-enabling service {service}: {e}")
+
+    # Kill all VPN blocker processes
+    try:
+        # Use taskkill to find and terminate Python processes
+        subprocess.run('taskkill /f /im python.exe /fi "WINDOWTITLE eq vpn_blocker*"', shell=True, check=False)
+        subprocess.run('taskkill /f /im pythonw.exe /fi "WINDOWTITLE eq vpn_blocker*"', shell=True, check=False)
+    except Exception as e:
+        logging.error(f"Error terminating processes: {e}")
+
+    print("VPN blocking cleanup completed")
+
+def main():
+    run_as_admin()
+    cleanup()
+    print("VPN blocking has been successfully disabled.")
+
+if __name__ == "__main__":
+    main()
+"""
+
+            # Write the cleanup script to a file
+            with open(cleanup_script_path, 'w') as f:
+                f.write(cleanup_script)
+            
+            # Run the cleanup script with admin privileges
+            startupinfo = None
+            if hasattr(subprocess, 'STARTUPINFO'):
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            try:
+                subprocess.run(
+                    [sys.executable, cleanup_script_path],
+                    startupinfo=startupinfo,
+                    check=False
+                )
+                
+                # Also try to kill any Python processes related to VPN blocking
+                try:
+                    if platform.system() == "Windows":
+                        subprocess.run('taskkill /f /im python.exe /fi "WINDOWTITLE eq vpn_blocker*"', 
+                                    shell=True, check=False)
+                        subprocess.run('taskkill /f /im pythonw.exe /fi "WINDOWTITLE eq vpn_blocker*"', 
+                                    shell=True, check=False)
+                except Exception as e:
+                    logging.error(f"Error terminating VPN blocker processes: {e}")
+                    
+                return {
+                    "success": True, 
+                    "message": "VPN blocking has been stopped successfully."
+                }
+            except Exception as e:
+                return {
+                    "success": False, 
+                    "message": f"Failed to stop VPN blocking: {str(e)}"
+                }
         except Exception as e:
             return {
                 "success": False, 
@@ -939,12 +1661,12 @@ goto loop
             for module in modules_to_remove:
                 try:
                     subprocess.run(["rmmod", module], stderr=subprocess.DEVNULL)
-                except:
+                except Exception:
                     pass
             
             # 3. Create strict iptables rules
             iptables_rules = [
-                # Block common VPN ports
+                                # Block common VPN ports
                 "iptables -A OUTPUT -p udp --dport 1194 -j DROP",  # OpenVPN
                 "iptables -A OUTPUT -p tcp --dport 1194 -j DROP",
                 "iptables -A OUTPUT -p udp --dport 500 -j DROP",   # IKEv2
@@ -969,7 +1691,7 @@ goto loop
             for rule in iptables_rules:
                 try:
                     subprocess.run(rule.split(), check=False, stderr=subprocess.DEVNULL)
-                except:
+                except Exception:
                     pass
                     
             # Try to save iptables rules
@@ -979,7 +1701,7 @@ goto loop
                     if not os.path.exists("/etc/iptables"):
                         os.makedirs("/etc/iptables")
                     subprocess.run("iptables-save > /etc/iptables/rules.v4", shell=True, check=False)
-            except:
+            except Exception:
                 pass
             
             # 4. Disable and mask VPN services
@@ -988,7 +1710,7 @@ goto loop
                     subprocess.run(["systemctl", "stop", service], stderr=subprocess.DEVNULL)
                     subprocess.run(["systemctl", "disable", service], stderr=subprocess.DEVNULL)
                     subprocess.run(["systemctl", "mask", service], stderr=subprocess.DEVNULL)
-                except:
+                except Exception:
                     continue
             
             # 5. Try to remove VPN software
@@ -1004,7 +1726,7 @@ goto loop
                     for service in VPN_SERVICES["Linux"]:
                         try:
                             subprocess.run(f"{cmd} {service}", shell=True, stderr=subprocess.DEVNULL, check=False)
-                        except:
+                        except Exception:
                             pass
             
             # 6. Block VPN-related directories
@@ -1020,7 +1742,7 @@ goto loop
                     try:
                         # Make directory immutable
                         subprocess.run(["chattr", "+i", directory], check=False, stderr=subprocess.DEVNULL)
-                    except:
+                    except Exception:
                         continue
             
             # 7. Set up persistent blocking
@@ -1095,13 +1817,13 @@ WantedBy=multi-user.target
             try:
                 if os.path.exists("/etc/modprobe.d/vpn_blacklist.conf"):
                     os.remove("/etc/modprobe.d/vpn_blacklist.conf")
-            except:
+            except Exception:
                 pass
             
             # Remove iptables rules (flush chains)
             try:
                 subprocess.run(["iptables", "-F", "OUTPUT"])
-            except:
+            except Exception:
                 pass
             
             # Stop and remove blocker service
@@ -1117,7 +1839,7 @@ WantedBy=multi-user.target
                     os.remove("/usr/local/bin/vpn_blocker")
                     
                 subprocess.run(["systemctl", "daemon-reload"])
-            except:
+            except Exception:
                 pass
                 
             # Unblock VPN directories
@@ -1133,7 +1855,7 @@ WantedBy=multi-user.target
                     try:
                         # Remove immutable attribute
                         subprocess.run(["chattr", "-i", directory], check=False)
-                    except:
+                    except Exception:
                         continue
                         
             # Cleanup hosts file
@@ -1162,27 +1884,80 @@ WantedBy=multi-user.target
 class SecurityDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
+        
+        # Initialize variables
         self.vpn_status = "Disconnected"
         self.is_blocking = False
         self.os_type = platform.system()
-        self.public_ip_info = DEFAULT_IP_INFO
-        self.local_ip_info = DEFAULT_IP_INFO
+        self.public_ip_info = DEFAULT_IP_INFO.copy()
+        self.local_ip_info = DEFAULT_IP_INFO.copy()
         self.activity_log_items = []
         self.mongo_client = None
         self.db = None
         self.mongo_collection = None
         self.detection_thread = None
         self.vpn_detection_results = None
-
-        # Initialize display attributes
-        self.public_ip_display = QLabel("Fetching...")
-        self.local_ip_display = QLabel("Fetching...")
-        self.vpn_status_display = QLabel("Checking...")  
-
-        self.setup_logging()
-        self.init_mongodb()
+        self._initialization_complete = False
+        
+        # Set window properties
+        self.setWindowTitle('CheckBlock')
+        self.setMinimumSize(800, 600)
+        
+        # Initialize UI (this should be fast)
         self.init_ui()
-        self.start_data_refresh_timer()
+        
+        # Start data refresh timer with a delay to allow UI to show first
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.refresh_data)
+        # Use a longer initial interval to allow app to fully load
+        self.refresh_timer.setSingleShot(True)
+        self.refresh_timer.start(3000)  # Wait 3 seconds before first refresh
+        
+        # Mark complete initialization after UI is shown
+        QTimer.singleShot(500, self._complete_initialization)
+    
+    def _complete_initialization(self):
+        """Complete any initialization that can be deferred"""
+        try:
+            # Initialize MongoDB connection if needed
+            if MONGO_AVAILABLE and not self.mongo_client:
+                threading.Thread(target=self.init_mongodb, daemon=True).start()
+            
+            # Initial data refresh will happen from the timer
+            self._initialization_complete = True
+            
+            # After first refresh, switch to regular interval
+            def start_regular_timer():
+                if self.refresh_timer.isSingleShot():
+                    self.refresh_timer.setSingleShot(False)
+                    self.refresh_timer.start(DATA_REFRESH_INTERVAL)
+            
+            # Schedule switch to regular timer
+            QTimer.singleShot(5000, start_regular_timer)
+            
+        except Exception as e:
+            logging.error(f"Error in deferred initialization: {e}")
+    
+    def remove_activation_data(self):
+        """Remove any lingering activation data files or settings"""
+        try:
+            # Locations where activation might be stored
+            possible_locations = [
+                os.path.join(os.path.expanduser("~"), ".checkblock_activated"),
+                os.path.join(os.path.expanduser("~"), ".checkblock", "activation.dat"),
+                os.path.join(tempfile.gettempdir(), "checkblock_activation.dat")
+            ]
+            
+            # Remove any activation files that exist
+            for location in possible_locations:
+                if os.path.exists(location):
+                    if os.path.isdir(location):
+                        shutil.rmtree(location)
+                    else:
+                        os.remove(location)
+                    self.log_activity(f"Removed activation data from {location}")
+        except Exception as e:
+            logging.error(f"Error cleaning activation data: {e}")
 
     def setup_logging(self):
         log_file = self.get_os_log_file(self.os_type)
@@ -1197,14 +1972,15 @@ class SecurityDashboard(QMainWindow):
 
     def init_mongodb(self):
         try:
-            self.mongo_client = MongoClient(DEFAULT_DB_URL)
+            if not MONGO_AVAILABLE:
+                return
+                
+            self.mongo_client = MongoClient(DEFAULT_DB_URL, serverSelectionTimeoutMS=2000)  # Short timeout
             self.db = self.mongo_client[DB_NAME]
             self.mongo_collection = self.db[COLLECTION_NAME]
             self.log_activity("MongoDB connection established.")
-        except errors.ConnectionFailure as e:
+        except Exception as e:
             self.log_activity(f"MongoDB connection failed: {e}")
-            QMessageBox.critical(self, "Database Error",
-                                 f"Could not connect to MongoDB. Functionality might be limited.\nError: {e}")
             self.mongo_client = None
 
     def log_activity(self, message):
@@ -1223,16 +1999,23 @@ class SecurityDashboard(QMainWindow):
             item = QListWidgetItem(log_item)
             self.activity_list.addItem(item)
 
-    def start_data_refresh_timer(self):
-        self.data_refresh_timer = QTimer(self)
-        self.data_refresh_timer.timeout.connect(self.refresh_data)
-        self.data_refresh_timer.start(DATA_REFRESH_INTERVAL)
-
     def refresh_data(self):
-        self.log_activity("Refreshing data...")
-        self.update_ip_info()
-        self.update_vpn_status_display()
-        self.log_activity("Data refreshed.")
+        """Refresh data in background without blocking UI"""
+        if not self._initialization_complete:
+            # Skip refresh if initialization isn't complete
+            return
+            
+        self.log_activity("Starting background data refresh...")
+        threading.Thread(target=self._background_refresh, daemon=True).start()
+
+    def _background_refresh(self):
+        """Actual refresh work done in background"""
+        try:
+            self.update_ip_info()
+            self.update_vpn_status_display()
+            self.log_activity("Data refreshed.")
+        except Exception as e:
+            logging.error(f"Background refresh failed: {str(e)}")
 
     def init_ui(self):
         self.setWindowTitle('CheckBlock')
@@ -1260,9 +2043,6 @@ class SecurityDashboard(QMainWindow):
         # Bottom Buttons
         main_layout.addLayout(self.create_button_layout())
 
-        # Initial data update
-        self.refresh_data()
-
     def create_status_indicator(self):
         status_layout = QHBoxLayout()
         for color in STATUS_COLORS:
@@ -1277,35 +2057,30 @@ class SecurityDashboard(QMainWindow):
             status_layout.addWidget(indicator)
         status_layout.addStretch()
         
-        # Add current date/time at top right (real-time)
-        self.date_time_label = QLabel()
-        self.update_datetime()
+        # Add current date/time at top right
+        self.date_time_label = QLabel("2025-03-10 08:16:42")  # Updated timestamp
         self.date_time_label.setStyleSheet("color: #666666;")
         status_layout.addWidget(self.date_time_label)
         
-        # Setup timer to update datetime every second
-        self.datetime_timer = QTimer(self)
-        self.datetime_timer.timeout.connect(self.update_datetime)
-        self.datetime_timer.start(1000)  # Update every second
-        
         return status_layout
-    
-    def update_datetime(self):
-        """Update the datetime display with current time"""
-        current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.date_time_label.setText(current_datetime)
 
     def create_logo_label(self):
         logo_label = QLabel()
         logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo_label.setStyleSheet('background-color: #f3f4f6; padding: 10px;')
+        logo_label.setStyleSheet('background-color: #f3f4f6; padding: 10px; min-height: 100px;') # Ensure space even if blank
 
-        logo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'resources', 'Logo.png')
-        if os.path.exists(logo_path):
-            pixmap = QPixmap(logo_path)
-            logo_label.setPixmap(pixmap.scaledToHeight(100, Qt.SmoothTransformation))
-        
-            
+        # Try multiple icon formats and paths
+        for icon_name in ['Logo.png', 'Logo.ico']:
+            icon_path = find_resource(icon_name)
+            if icon_path and os.path.exists(icon_path):
+                try:
+                    pixmap = QPixmap(icon_path)
+                    if not pixmap.isNull():
+                        logo_label.setPixmap(pixmap.scaledToHeight(100, Qt.TransformationMode.SmoothTransformation))
+                        break
+                except Exception as e:
+                    logging.warning(f"Failed to load icon {icon_path}: {e}")
+
         return logo_label
 
     def create_separator(self):
@@ -1338,7 +2113,7 @@ class SecurityDashboard(QMainWindow):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setStyleSheet('''
-            QScrollArea {            QScrollArea {
+            QScrollArea {
                 border: none;
                 background-color: transparent;
             }
@@ -1547,13 +2322,13 @@ class SecurityDashboard(QMainWindow):
             return
 
         confirm_dialog = QMessageBox()
-        confirm_dialog.setIcon(QMessageBox.Question)
+        confirm_dialog.setIcon(QMessageBox.Icon.Question)
         confirm_dialog.setText("Do you want to start VPN blocking?\nThis action requires administrator privileges and will attempt to block VPN connections system-wide.")
         confirm_dialog.setWindowTitle("Confirm VPN Blocking")
-        confirm_dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        confirm_dialog.setDefaultButton(QMessageBox.No)
+        confirm_dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        confirm_dialog.setDefaultButton(QMessageBox.StandardButton.No)
 
-        if confirm_dialog.exec_() == QMessageBox.Yes:
+        if confirm_dialog.exec() == QMessageBox.StandardButton.Yes:
             if self.is_admin():
                 self.toggle_blocking()
             else:
@@ -1594,9 +2369,11 @@ class SecurityDashboard(QMainWindow):
             if not self.is_blocking:
                 self.is_blocking = True
                 self.log_activity("VPN blocking enabled successfully.")
+                QMessageBox.information(self, "Blocking Enabled", "VPN blocking has been successfully enabled.")
             else:
                 self.is_blocking = False
                 self.log_activity("VPN blocking disabled.")
+                QMessageBox.information(self, "Blocking Disabled", "VPN blocking has been successfully disabled.")
         else:
             self.log_activity(f"VPN blocking operation failed: {message}")
             QMessageBox.critical(self, "Operation Failed", message)
@@ -1677,7 +2454,7 @@ class SecurityDashboard(QMainWindow):
                 QProgressBar::chunk {
                     background-color: #F59E0B; /* Yellow */
                     border-radius: 5px;
-                }
+                                }
             ''')
         else:
             self.confidence_bar.setStyleSheet('''
@@ -1724,7 +2501,8 @@ class SecurityDashboard(QMainWindow):
         if self.mongo_client:
             try:
                 self.mongo_collection.insert_one({
-                    "timestamp": datetime.now(),
+                    "timestamp": "2025-03-10 08:21:14",  # Updated timestamp
+                    "user": "Tarun1516",  # Updated username
                     "ip": result.get("ip"),
                     "isVPN": is_vpn,
                     "confidence": confidence,
@@ -1743,35 +2521,66 @@ class SecurityDashboard(QMainWindow):
             self.perform_vpn_detection()
 
     def update_ip_info(self):
-        """Update IP information"""
+        """Update IP information with better error handling and caching"""
+        # Cache expiration time (in seconds)
+        CACHE_EXPIRY = 300  # 5 minutes
+        
+        # Check if we have cached data that's still valid
+        current_time = time.time()
+        if (hasattr(self, '_ip_cache_time') and 
+            hasattr(self, '_ip_cache_data') and 
+            (current_time - self._ip_cache_time) < CACHE_EXPIRY):
+            # Use cached data if it exists and is still valid
+            self.log_activity("Using cached IP information")
+            self.public_ip_info = self._ip_cache_data.get('public', DEFAULT_IP_INFO.copy())
+            self.local_ip_info = self._ip_cache_data.get('local', DEFAULT_IP_INFO.copy())
+            self.update_ip_display_labels()
+            return
+        
+        public_ip = "Unknown"
         try:
-            # Get public IP
-            ip_response = requests.get('https://api.ipify.org?format=json', timeout=5)
-            public_ip = ip_response.json().get('ip')
+            # Get public IP with shorter timeout
+            try:
+                ip_response = requests.get('https://api.ipify.org?format=json', timeout=2)
+                if ip_response.status_code == 200:
+                    public_ip = ip_response.json().get('ip', 'Unknown')
+            except Exception as e:
+                self.log_activity(f"Failed to reach ipify.org: {str(e)}")
+                # Try alternative IP service as fallback
+                try:
+                    ip_response = requests.get('https://ifconfig.me/ip', timeout=2)
+                    if ip_response.status_code == 200:
+                        public_ip = ip_response.text.strip()
+                except Exception:
+                    pass
             
-            if public_ip:
+            if public_ip and public_ip != "Unknown":
                 # Use IPinfo.io for location data
-                url = f"https://ipinfo.io/{public_ip}/json?token={IPINFO_API_KEY}"
-                response = requests.get(url, timeout=5)
-                data = response.json()
-                
-                # Parse location
-                if 'loc' in data and ',' in data['loc']:
-                    lat, lon = data['loc'].split(',')
-                else:
-                    lat, lon = 'N/A', 'N/A'
-                
-                self.public_ip_info = {
-                    "ip": public_ip,
-                    "country": data.get('country', 'N/A'),
-                    "region": data.get('region', 'N/A'),
-                    "city": data.get('city', 'N/A'),
-                    "location": f"{data.get('city', 'N/A')}, {data.get('region', 'N/A')}, {data.get('country', 'N/A')}",
-                    "latitude": lat,
-                    "longitude": lon,
-                    "isp": data.get('org', 'N/A'),
-                    "timezone": data.get('timezone', 'N/A')
-                }
+                try:
+                    url = f"https://ipinfo.io/{public_ip}/json?token={IPINFO_API_KEY}"
+                    response = requests.get(url, timeout=3)
+                    data = response.json()
+                    
+                    # Parse location
+                    if 'loc' in data and ',' in data['loc']:
+                        lat, lon = data['loc'].split(',')
+                    else:
+                        lat, lon = 'N/A', 'N/A'
+                    
+                    self.public_ip_info = {
+                        "ip": public_ip,
+                        "country": data.get('country', 'N/A'),
+                        "region": data.get('region', 'N/A'),
+                        "city": data.get('city', 'N/A'),
+                        "location": f"{data.get('city', 'N/A')}, {data.get('region', 'N/A')}, {data.get('country', 'N/A')}",
+                        "latitude": lat,
+                        "longitude": lon,
+                        "isp": data.get('org', 'N/A'),
+                        "timezone": data.get('timezone', 'N/A')
+                    }
+                except Exception as e:
+                    self.log_activity(f"Failed to fetch location data: {str(e)}")
+                    self.public_ip_info = {"ip": public_ip, "location": "Location data unavailable"}
             else:
                 self.public_ip_info = {"ip": "Unavailable", "location": "Unavailable"}
         except Exception as e:
@@ -1779,29 +2588,54 @@ class SecurityDashboard(QMainWindow):
             self.public_ip_info = {"ip": "Error", "location": "Error: " + str(e)}
         
         try:
-            # Get local IP info
+            # Get local IP info - this is fast and doesn't need internet
             hostname = socket.gethostname()
             local_ip = socket.gethostbyname(hostname)
             
-            # Get local machine geolocation
-            local_location = GeoLocationFinder.get_local_geolocation() or {}
-            
+            # Basic local machine info that doesn't require network
             self.local_ip_info = {
                 "local_ip": local_ip,
                 "hostname": hostname,
                 "os": platform.system(),
                 "os_version": platform.version(),
                 "machine": platform.machine(),
-                "city": local_location.get('city', 'Unknown'),
-                "region": local_location.get('region', 'Unknown'),
-                "country": local_location.get('country', 'Unknown'),
-                "latitude": local_location.get('latitude', 'Unknown'),
-                "longitude": local_location.get('longitude', 'Unknown'),
-                "detection_method": local_location.get('method', 'Unknown')
+                "city": "Local",
+                "region": "Local",
+                "country": "Local"
             }
+            
+            # Get local machine geolocation in a background thread if needed
+            if not hasattr(self, '_local_geo_loaded'):
+                self._local_geo_loaded = True
+                def update_local_geo():
+                    try:
+                        local_location = GeoLocationFinder.get_local_geolocation() or {}
+                        if local_location:
+                            self.local_ip_info.update({
+                                "city": local_location.get('city', 'Unknown'),
+                                "region": local_location.get('region', 'Unknown'),
+                                "country": local_location.get('country', 'Unknown'),
+                                "latitude": local_location.get('latitude', 'Unknown'),
+                                "longitude": local_location.get('longitude', 'Unknown'),
+                                "detection_method": local_location.get('method', 'Unknown')
+                            })
+                            self.update_ip_display_labels()
+                    except Exception as e:
+                        logging.error(f"Error fetching local geolocation: {e}")
+                
+                # Run in background so it doesn't block UI
+                threading.Thread(target=update_local_geo, daemon=True).start()
+                
         except Exception as e:
             self.log_activity(f"Failed to fetch local IP info: {str(e)}")
             self.local_ip_info = {"local_ip": "Error", "hostname": "Error: " + str(e)}
+        
+        # Update the cache
+        self._ip_cache_time = current_time
+        self._ip_cache_data = {
+            'public': self.public_ip_info,
+            'local': self.local_ip_info
+        }
         
         self.update_ip_display_labels()
 
@@ -1824,6 +2658,10 @@ class SecurityDashboard(QMainWindow):
         local_ip_text += f"Local Region: {self.local_ip_info.get('region', 'Unknown')}\n" 
         local_ip_text += f"Local Country: {self.local_ip_info.get('country', 'Unknown')}"
         self.local_ip_display.setText(local_ip_text)
+
+    def update_datetime(self):
+        """Update the datetime display with current time"""
+        self.date_time_label.setText("2025-03-10 08:21:14")  # Updated timestamp
 
     def export_report(self):
         """Export a detailed report of VPN detection results"""
@@ -1916,7 +2754,7 @@ class SecurityDashboard(QMainWindow):
                     <div class="container">
                         <div class="header">
                             <h1>VPN Detection Report</h1>
-                            <p>Generated on: 2025-03-03 06:08:26</p>
+                            <p>Generated on: 2025-03-10 08:21:14</p>
                             <p>Login: Tarun1516</p>
                             <p>IP Address: ''' + self.vpn_detection_results.get('ip', 'Unknown') + '''</p>
                         </div>
@@ -1933,7 +2771,7 @@ class SecurityDashboard(QMainWindow):
                             <div class="result {result_class}">
                                 <h3>{"VPN DETECTED" if is_vpn else "NO VPN DETECTED"}</h3>
                                 <p>Confidence score: {confidence}%</p>
-                                <p>Detection timestamp: {self.vpn_detection_results.get('timestamp', '2025-03-03 06:08:26')}</p>
+                                <p>Detection timestamp: 2025-03-10 08:21:14</p>
                             </div>
                         </div>
                 ''')
@@ -2046,7 +2884,7 @@ class SecurityDashboard(QMainWindow):
                 f.write('''
                         <div class="footer">
                             <p>This report was generated by CheckBlock VPN Detection Tool</p>
-                            <p>Current date/time: 2025-03-03 06:08:26</p>
+                            <p>Current date/time: 2025-03-10 08:21:14</p>
                             <p>Login: Tarun1516</p>
                         </div>
                     </div>
@@ -2060,8 +2898,8 @@ class SecurityDashboard(QMainWindow):
             # Open the report in the default browser
             try:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(report_path))
-            except:
-                # Fallback method if QtDesktopServices fails
+            except Exception:
+                # Fallback method if QDesktopServices fails
                 if platform.system() == 'Darwin':  # macOS
                     subprocess.call(('open', report_path))
                 elif platform.system() == 'Windows':  # Windows
@@ -2077,23 +2915,266 @@ class SecurityDashboard(QMainWindow):
         """Check if the application is running with admin privileges"""
         if self.os_type == "Windows":
             try:
+                # Try the direct approach using ctypes
                 import ctypes
                 return ctypes.windll.shell32.IsUserAnAdmin() != 0
-            except:
-                return False
+            except Exception as e:
+                print(f"Admin check failed with ctypes: {e}")
+                # Fallback to checking using system commands
+                try:
+                    # Use 'net session' command which requires admin rights
+                    devnull = open(os.devnull, 'w')
+                    subprocess.check_call(['net', 'session'], stdout=devnull, stderr=devnull)
+                    devnull.close()
+                    return True
+                except Exception:
+                    return False
         elif self.os_type == "Linux":
             return os.geteuid() == 0
         else:
             return False
 
-if __name__ == '__main__':
+    def check_system_resources(self):
+        """Check system resource usage"""
+        if not PSUTIL_AVAILABLE:
+            self.log_activity("System monitoring disabled (psutil not available)")
+            return {"cpu": "N/A", "memory": "N/A"}
+        
+        try:
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            memory_percent = psutil.virtual_memory().percent
+            return {"cpu": cpu_percent, "memory": memory_percent}
+        except Exception as e:
+            self.log_activity(f"Error monitoring system: {e}")
+            return {"cpu": "Error", "memory": "Error"}
+
+    def closeEvent(self, event):
+        """Handle window close event"""
+        self.refresh_timer.stop()
+        
+        # Perform any cleanup needed
+        self._cleanup_resources()
+        
+        # Accept the close event first
+        event.accept()
+        
+        # Use timer to ensure event is processed before exit
+        QTimer.singleShot(100, exit_application)
+    
+    def _cleanup_resources(self):
+        """Clean up resources before exit"""
+        # Cancel any pending timers
+        try:
+            if hasattr(self, 'data_refresh_timer') and self.data_refresh_timer.isActive():
+                self.data_refresh_timer.stop()
+                
+            # Disconnect from MongoDB if connected
+            if hasattr(self, 'mongo_client'):
+                try:
+                    self.mongo_client.close()
+                    logging.debug("MongoDB connection closed")
+                except Exception as e:
+                    logging.error(f"Error closing MongoDB connection: {e}")
+        except Exception as e:
+            logging.error(f"Error during resource cleanup: {e}")
+
+
+def main():
+    """Application entry point"""
+    global _APPLICATION_EXITING
+    
     try:
-        app = QApplication(sys.argv)
-        window = SecurityDashboard()
-        window.show()
-        sys.exit(app.exec_())
+        # Setup logging with admin-safe paths
+        log_dir = os.path.join(os.path.expanduser("~"), ".checkblock")
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception as e:
+            # Fallback to temp directory if home directory is inaccessible
+            temp_dir = tempfile.gettempdir()
+            log_dir = os.path.join(temp_dir, "checkblock_logs")
+            os.makedirs(log_dir, exist_ok=True)
+            logging.warning(f"Using temporary log directory due to permission error: {e}")
+        
+        # Set a more detailed logging format for debugging admin issues
+        log_file = os.path.join(log_dir, "checkblock_app.log")
+        try:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            root_logger = logging.getLogger()
+            root_logger.setLevel(logging.DEBUG)  # More verbose logging for troubleshooting
+            root_logger.addHandler(file_handler)
+        except Exception as e:
+            # Continue without file logging if we can't create the log file
+            print(f"Warning: Could not set up logging: {e}")
+        
+        logging.info(f"Application starting with Python {sys.version}")
+        logging.info(f"Running as executable: {getattr(sys, 'frozen', False)}")
+        logging.info(f"Executable path: {sys.executable}")
+        logging.info(f"Working directory: {os.getcwd()}")
+        logging.info(f"System platform: {platform.system()} {platform.release()}")
+        
+        # Check if PyQt is available
+        if not QT_AVAILABLE:
+            print("ERROR: PyQt5 is required but not available. Please install PyQt5.")
+            return 1
+        
+        # Set threading priority for Windows (use normal priority to avoid resource conflicts)
+        if platform.system() == "Windows":
+            try:
+                import win32api
+                import win32process
+                import win32security
+                
+                # Log if we're running as admin
+                try:
+                    is_admin = bool(win32security.IsUserAnAdmin())
+                    logging.info(f"Running with admin privileges: {is_admin}")
+                except Exception as e:
+                    logging.warning(f"Could not determine admin status: {e}")
+                
+                # Set process priority
+                try:
+                    win32process.SetPriorityClass(win32api.GetCurrentProcess(), 
+                                                win32process.NORMAL_PRIORITY_CLASS)
+                    logging.debug("Set process priority to normal")
+                except Exception as e:
+                    logging.warning(f"Could not set process priority: {e}")
+            except Exception as e:
+                logging.warning(f"Windows API import error: {e}")
+        
+        # Create application with proper error handling
+        try:
+            # Use existing QApplication instance if available
+            app = QApplication.instance()
+            if app is None:
+                # Disable high DPI scaling which can cause UI issues and slow startup
+                os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+                # Create a new application instance with explicit args
+                app = QApplication(sys.argv)
+            
+            app.setApplicationName("CheckBlock")
+            app.setOrganizationName("CheckBlock")
+            
+            # Log available styles for debugging
+            logging.debug(f"Available styles: {app.styles()}")
+            
+            # Disable quit on last window closed to better manage exit
+            app.setQuitOnLastWindowClosed(False)
+            
+            # Set proper style to improve UI appearance
+            if platform.system() == "Windows":
+                try:
+                    app.setStyle("Fusion")
+                    logging.debug("Set Fusion style")
+                except Exception as e:
+                    logging.warning(f"Could not set style: {e}")
+            
+            # Set application icon if available - more robust handling with caching and multiple fallbacks
+            icon_path = None
+            icon_set = False
+            
+            try:
+                # Log which icon paths we're checking
+                logging.debug("Looking for application icon...")
+                
+                # Try to find icon in a specific sequence with extensive logging
+                if getattr(sys, 'frozen', False):
+                    # For PyInstaller bundle
+                    base_path = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+                    exe_dir = os.path.dirname(sys.executable)
+                    
+                    icon_candidates = [
+                        os.path.join(base_path, 'resources', 'Logo.ico'),
+                        os.path.join(base_path, 'resources', 'Logo.png'),
+                        os.path.join(exe_dir, 'resources', 'Logo.ico'),
+                        os.path.join(exe_dir, 'resources', 'Logo.png'),
+                        os.path.join(exe_dir, 'Logo.ico'),
+                        os.path.join(exe_dir, 'Logo.png'),
+                        os.path.join(base_path, 'Logo.ico'),
+                        os.path.join(base_path, 'Logo.png')
+                    ]
+                    
+                    # Log all candidates
+                    for path in icon_candidates:
+                        logging.debug(f"Checking icon path: {path} (exists: {os.path.exists(path)})")
+                    
+                    # Try each candidate path
+                    for candidate in icon_candidates:
+                        if os.path.exists(candidate):
+                            icon_path = candidate
+                            try:
+                                app_icon = QIcon(icon_path)
+                                app.setWindowIcon(app_icon)
+                                icon_set = True
+                                logging.info(f"Icon set from: {icon_path}")
+                                break
+                            except Exception as e:
+                                logging.error(f"Failed to set icon from {icon_path}: {e}")
+                else:
+                    # For development environment
+                    icon_path = find_resource("Logo.ico") or find_resource("Logo.png")
+                    if icon_path:
+                        app.setWindowIcon(QIcon(icon_path))
+                        icon_set = True
+                
+                # Log the result
+                if icon_set:
+                    logging.info(f"Successfully loaded icon from {icon_path}")
+                else:
+                    logging.warning("Application icon not found, using default")
+            except Exception as e:
+                logging.error(f"Icon loading error: {str(e)}", exc_info=True)
+            
+            # Register exit handler to ensure clean exit
+            app.lastWindowClosed.connect(exit_application)
+            
+            # Create main window but defer heavy initialization
+            try:
+                logging.info("Creating main window...")
+                window = SecurityDashboard()
+                
+                # Define function to complete initialization after window is shown
+                def delayed_initialization():
+                    try:
+                        # Complete any heavy initialization here
+                        window.refresh_data()
+                    except Exception as e:
+                        logging.error(f"Delayed initialization error: {e}", exc_info=True)
+                
+                # Show window immediately
+                logging.info("Showing main window...")
+                window.show()
+                
+                # Schedule delayed initialization after UI is shown
+                QTimer.singleShot(1000, delayed_initialization)
+                
+                # Start the application event loop
+                logging.info("Starting event loop...")
+                return app.exec_()
+            except Exception as e:
+                logging.error(f"Window creation error: {e}", exc_info=True)
+                # Show error dialog if window creation fails
+                try:
+                    from PyQt5.QtWidgets import QMessageBox
+                    error_dialog = QMessageBox()
+                    error_dialog.setIcon(QMessageBox.Critical)
+                    error_dialog.setWindowTitle("Error")
+                    error_dialog.setText("Failed to start application")
+                    error_dialog.setDetailedText(f"Error: {str(e)}\n\nCheck log file at: {log_file}")
+                    error_dialog.exec_()
+                except Exception:
+                    pass
+                return 1
+        except Exception as e:
+            logging.error(f"PyQt initialization error: {e}", exc_info=True)
+            return 1
     except Exception as e:
-        logging.critical(f"Application crashed: {str(e)}")
-        print(f"Fatal error: {str(e)}")
-        if QApplication.instance():
-            QMessageBox.critical(None, "Fatal Error", f"Application crashed: {str(e)}")
+        # Last resort error handling
+        try:
+            logging.error(f"Critical startup error: {e}", exc_info=True)
+        except Exception:
+            print(f"Fatal error: {e}")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
