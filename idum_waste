@@ -5029,5 +5029,12 @@ there must be footer (i have the code for it) that is placed at the bottom of ev
 similarly i there must be  a navbar.py ( i have the codes for this also) this should be placed in the right side top corner below the header for which i ahve left the space .. through this navbar.py only the users can shift or change between pages .. 
 and in the left of the navbar.py there will a logo of the application that is present in all the 3 pages .. 
 the application is created not for full sized windows and created like only for a medium sized of the screen and cannot be made into full size .. 
+also i have 4 logos..
+1.company_logo.png- this should be displayed in the loginpage only 
+2.product_logo_transaparent_bg.png- this is the logo that is displayed in the 3 pages 
+3.Logo_png-this is should be displayed as the icon for build the .deb in linux
+4.Logo.ico - this should be displayed as the icon for building the windows application..
+
+when creating a structure the structure should include the buil directory in which all thee building of the application files will be placed .. when the application is built it should not have any starting trouble i.e when the application is built it should start imeedately after clicking on it and when closed it should close the application and should not open again .. also create me like when the application is run i a system that has no mudules or libraries or the dependeies it should run without any errors about the libraries please do it like that ..
 this is complete working of my application .. now below all this i will give the code for all the files 
-the work of u is to analyse the working which i have given to u above and create the structure for the above working requirments ..
+the work of u is to analyse the working which i have given to u above and create the structure for the above working requirments ..when creat
