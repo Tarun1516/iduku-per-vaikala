@@ -1,3 +1,12 @@
+
+iam going to build an application for windows and linux and the application is about vpn detection and blocking and the name of teh application checkblock and i ahve decided to use QT framework for that and i have the codes for vpn_detection.py and the vpn_blockig.py and for the ui part also i have the codes .. 
+i have 3 page and a login page that is started up on the 1st time of opening the application if the application is logged in then the login page no need show that application .. and the 3 pages are 
+1. main page (the application works )
+2. dashboard ( the datas that are sent and recorded from the main page)
+3. profile ( the details that are fetched from the backend supabase when the user logged in )
+4. the login page (that is asked only the 1st time after logging in , no need for this page .. the user can continue to use the application .. also the user can use the application only if it is logged in)
+for which also the code is attached below 
+
 #vpn_detection.py 
 
 import requests
@@ -3390,11 +3399,1643 @@ if __name__ == '__main__':
     window.show()
     sys.exit(app.exec())
 
+#dashboradpage.py 
+import sys
+import math
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
+    QSizePolicy, QMessageBox, QSpacerItem
+)
+from PyQt6.QtGui import QPainter, QColor, QBrush, QPen, QFont, QFontMetrics, QPalette
+from PyQt6.QtCore import Qt, QRectF, QPointF, QSize
 
-what i want is that i want the whole 3 codes into a single code like.. 
-the ui should be the same (pyqt6) please do not change or alter anything in that and when the mainpage.py(pyqt6 code which is given above ) is started or run then the #vpndetection.py should also start and the output obtained from the vpndetcetion.py should be present in the mainpage.py .. i have given separte sections -public IP , local ip, vpn status in the mainpage.py for it so please arrange the output accordingly .. 
-and in the mainpage.py code i have given the button called "start blocking" if that button is clicked then the vpnblocking.py is run and the output from it is stored in the activity log section of the mainpage.py please do it accordingly ..
-and when the "refresh " button is clicked then the vpndetction.js code starts to run again from the 1st and the values(outputs) from this .py file is updated that updated output is shown in the mainpage.py
-i have placed another button called the "export button" when this button is clicked the output that is generated from the vpndetction.py at the time if clicking the button should be exported as .pdf and stored in the local storage of the system that the code is running please do it like this .. i have only included the button for this but not exporting part please include that also
-and please include this also whenever the vpndetection.js code is run it should be able to store the details like .. no.of times the code is run(both the node.js codes) and the outputs from both the node.js codes also and stores all these values in a separte file 
-note : please do not change the ui (pyqt6) part  or the 2 python codes codes i want all the 3 same code without altering anything u just have to integrate the 3 codes into a single .
+# --- Color Palette (from Tailwind classes) ---
+COLOR_BG_MAIN = "#f3f4f6"  # gray-100
+COLOR_BG_CARD = "#ffffff"
+COLOR_BORDER = "#000000"
+COLOR_TEXT_DEFAULT = "#000000"
+COLOR_TEXT_LG = "#111827" # gray-900 approx for title?
+COLOR_PIE_VPN_DETECTED = "#10B981" # green-500
+COLOR_PIE_VPN_NOT_DETECTED = "#F59E0B" # amber-500
+COLOR_TEXT_VPN_DETECTED = "#059669" # green-600
+COLOR_TEXT_VPN_NOT_DETECTED = "#D97706" # amber-600
+
+# --- Font Sizes (Approximations) ---
+FONT_SIZE_XS = 9
+FONT_SIZE_SM = 10
+FONT_SIZE_BASE = 11 # For labels/legend
+FONT_SIZE_LG = 14 # Title
+FONT_SIZE_4XL = 32 # Large numbers
+
+FONT_FAMILY_MONO = "Consolas, Courier New, monospace"
+
+# --- Data ---
+DATA = [
+    {'name': 'VPN Detected', 'value': 10},
+    {'name': 'VPN Not Detected', 'value': 5},
+]
+COLORS = [QColor(COLOR_PIE_VPN_DETECTED), QColor(COLOR_PIE_VPN_NOT_DETECTED)]
+
+
+# --- Custom Pie Chart Widget ---
+class PieChartWidget(QWidget):
+    def __init__(self, data, colors, parent=None):
+        super().__init__(parent)
+        self.data = data
+        self.colors = colors
+        self.total_value = sum(item['value'] for item in data)
+        self.setMinimumSize(200, 200) # Minimum size for the chart
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        widget_rect = self.rect()
+        side = min(widget_rect.width(), widget_rect.height())
+
+        # Reduce size slightly for padding and legend space
+        chart_diameter = side * 0.7
+        legend_height_estimate = len(self.data) * 20 + 10 # Estimate space for legend
+
+        # Adjust vertical position if legend is below
+        pie_top_margin = 20
+        available_height_for_pie = widget_rect.height() - legend_height_estimate - pie_top_margin
+        chart_diameter = min(chart_diameter, available_height_for_pie)
+        outer_radius = chart_diameter / 2
+
+        # Center the pie chart horizontally, position vertically
+        center_x = widget_rect.width() / 2
+        center_y = pie_top_margin + outer_radius # Top edge + radius
+        center = QPointF(center_x, center_y)
+
+        pie_rect = QRectF(center_x - outer_radius, center_y - outer_radius,
+                          chart_diameter, chart_diameter)
+
+        label_font = QFont(FONT_FAMILY_MONO, FONT_SIZE_SM)
+        label_pen = QPen(QColor(COLOR_TEXT_DEFAULT))
+        painter.setFont(label_font)
+        painter.setPen(label_pen)
+        fm = QFontMetrics(label_font)
+
+        start_angle = 90 * 16  # Start at the top (Qt angles are in 1/16th degrees)
+        label_radius_factor = 0.7 # How far out labels are (0.5 = center, 1.0 = edge)
+
+        if self.total_value == 0: # Avoid division by zero
+             # Draw a simple placeholder if no data
+             painter.setPen(QColor(COLOR_BORDER))
+             painter.setBrush(Qt.BrushStyle.NoBrush)
+             painter.drawEllipse(pie_rect)
+             painter.drawText(pie_rect, Qt.AlignmentFlag.AlignCenter, "No data")
+             return # Skip drawing slices/legend
+
+
+        # --- Draw Pie Slices and Labels ---
+        for i, item in enumerate(self.data):
+            if item['value'] <= 0: continue # Skip zero/negative values
+
+            angle_fraction = item['value'] / self.total_value
+            span_angle = int(angle_fraction * 360 * 16)
+
+            # Draw Slice
+            painter.setBrush(QBrush(self.colors[i % len(self.colors)]))
+            painter.setPen(Qt.PenStyle.NoPen) # No border on slices for this style
+            painter.drawPie(pie_rect, start_angle, span_angle)
+
+            # Draw Label (Percentage)
+            mid_angle_deg = -( (start_angle + span_angle / 2) / 16.0 ) # Degrees, adjust direction
+            label_radius = outer_radius * label_radius_factor
+            label_x = center.x() + label_radius * math.cos(math.radians(mid_angle_deg))
+            label_y = center.y() + label_radius * math.sin(math.radians(mid_angle_deg))
+            percent_text = f"{angle_fraction * 100:.0f}%"
+
+            # Adjust text anchor based on position relative to center
+            text_rect = fm.boundingRect(percent_text)
+            text_point = QPointF(label_x, label_y)
+            if label_x < center.x(): # Left side
+                 text_point.setX(label_x - text_rect.width())
+
+            text_point.setY(label_y - text_rect.height() / 2 + fm.ascent()/2) # Center vertically
+
+            painter.setPen(label_pen)
+            painter.drawText(text_point, percent_text)
+
+
+            start_angle += span_angle
+
+        # --- Draw Legend ---
+        legend_font = QFont(FONT_FAMILY_MONO, FONT_SIZE_BASE)
+        painter.setFont(legend_font)
+        fm_legend = QFontMetrics(legend_font)
+        legend_y_start = center_y + outer_radius + 20 # Below the pie
+        legend_x_start = center_x - (outer_radius * 0.8) # Align leftish
+        legend_item_height = fm_legend.height() + 4
+        color_box_size = fm_legend.height() * 0.8
+        text_margin = 5
+
+        for i, item in enumerate(self.data):
+            current_y = legend_y_start + i * legend_item_height
+
+            # Check if legend goes off widget
+            if current_y + legend_item_height > widget_rect.height():
+                # Handle overflow: Stop drawing, or implement columns, etc.
+                # For simplicity, we just stop if it overflows significantly.
+                if current_y > widget_rect.height() - 5: break # Stop if already mostly off
+
+            # Color Box
+            painter.setBrush(QBrush(self.colors[i % len(self.colors)]))
+            painter.setPen(Qt.PenStyle.NoPen)
+            color_rect = QRectF(legend_x_start, current_y, color_box_size, color_box_size)
+            painter.drawRect(color_rect)
+
+            # Text Label
+            painter.setPen(label_pen)
+            text_x = legend_x_start + color_box_size + text_margin
+            # Center text vertically with the color box
+            text_y = current_y + (color_box_size / 2) - (fm_legend.height()/2) + fm_legend.ascent()
+            painter.drawText(QPointF(text_x, text_y), item['name'])
+
+
+# --- Main Dashboard Widget ---
+class VPNDetectionStatsDashboardYaakai(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.data = DATA
+        self.colors = COLORS
+        self._init_ui()
+        self._apply_styles()
+
+    def _init_ui(self):
+        self.setWindowTitle("Checkblock VPN Stats")
+        self.setMinimumSize(600, 700) # Window size
+
+        # Overall layout centering the card
+        main_layout = QHBoxLayout(self)
+        main_layout.addStretch(1)
+        main_layout.addWidget(self._create_card())
+        main_layout.addStretch(1)
+
+        # Set overall background
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(COLOR_BG_MAIN))
+        self.setAutoFillBackground(True)
+        self.setPalette(palette)
+
+    def _create_card(self):
+        card_widget = QWidget()
+        card_widget.setObjectName("CardWidget")
+        card_widget.setFixedWidth(505)
+
+        card_layout = QVBoxLayout(card_widget)
+        card_layout.setContentsMargins(24, 24, 24, 24) # p-6
+        card_layout.setSpacing(16) # Approximation
+
+        # --- Header ---
+        header_layout = QVBoxLayout()
+        header_layout.setSpacing(8)
+        header_layout.setContentsMargins(8, 0, 8, 12) # px-2 mb-3
+
+        title_label = QLabel("checkblock")
+        title_label.setObjectName("CardTitle")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_layout.addWidget(title_label)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setObjectName("HeaderLine")
+        header_layout.addWidget(line)
+
+        # 65px empty space
+        header_layout.addSpacerItem(QSpacerItem(20, 65, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
+        card_layout.addLayout(header_layout)
+
+        # --- Pie Chart ---
+        self.pie_chart_widget = PieChartWidget(self.data, self.colors)
+        # Use addWidget with stretch factor 0 to prevent it taking excess vertical space
+        # Or set a fixed height if preferred over the internal calculation
+        chart_container_layout = QHBoxLayout() # To center if needed, or just add directly
+        chart_container_layout.addWidget(self.pie_chart_widget)
+        card_layout.addLayout(chart_container_layout, 1) # Give chart area stretch factor 1
+        # Set an explicit height for the chart container widget if needed:
+        # chart_container = QWidget()
+        # chart_container.setLayout(chart_container_layout)
+        # chart_container.setFixedHeight(256) # h-64 * 4 approx
+        # card_layout.addWidget(chart_container)
+        card_layout.addSpacing(16) # mb-4
+
+
+        # --- Total Stats Text ---
+        total_detections = sum(item['value'] for item in self.data)
+        total_label = QLabel(f"Total number of times the vpn detection is used : {total_detections}")
+        total_label.setObjectName("TotalStatsLabel")
+        total_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(total_label)
+        card_layout.addSpacing(24) # mb-6
+
+        # --- Stat Blocks ---
+        stats_layout = QHBoxLayout()
+        stats_layout.setSpacing(16) # gap-4
+
+        vpn_detected = next((item['value'] for item in self.data if item['name'] == 'VPN Detected'), 0)
+        vpn_not_detected = next((item['value'] for item in self.data if item['name'] == 'VPN Not Detected'), 0)
+
+        stats_layout.addWidget(self._create_stat_block(
+            "Vpn not detected", vpn_not_detected, COLOR_TEXT_VPN_NOT_DETECTED, "not_detected"
+        ))
+        stats_layout.addWidget(self._create_stat_block(
+            "Vpn detected", vpn_detected, COLOR_TEXT_VPN_DETECTED, "detected"
+        ))
+
+        card_layout.addLayout(stats_layout)
+
+        card_layout.addStretch(0) # Prevent bottom elements from stretching excessively
+
+        # Ensure card doesn't grow vertically unnecessarily if content is small
+        card_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+
+
+        return card_widget
+
+    def _create_stat_block(self, title_text, value, text_color_hex, stat_type):
+        block = QWidget()
+        block.setObjectName("StatBlock")
+        # Add a property for dynamic styling based on type
+        block.setProperty("statType", stat_type)
+
+        layout = QVBoxLayout(block)
+        layout.setContentsMargins(16, 16, 16, 16) # p-4
+        layout.setSpacing(8) # Approximation
+
+        title_label = QLabel(title_text)
+        title_label.setObjectName("StatBlockTitle")
+        layout.addWidget(title_label)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setObjectName("StatBlockLine")
+        layout.addWidget(line)
+
+        # Add spacing like mt-6 before the number
+        layout.addSpacerItem(QSpacerItem(20, 18, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)) # mt-6 approx
+
+        value_label = QLabel(str(value))
+        value_label.setObjectName("StatBlockValue")
+        value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Set color dynamically or via stylesheet property selector
+        value_label.setStyleSheet(f"color: {text_color_hex};") # Easiest way for this one
+        layout.addWidget(value_label)
+
+        layout.addStretch(1) # Push content up
+
+        return block
+
+    # --- Styling (QSS) ---
+    def _apply_styles(self):
+        styles = f"""
+            QWidget {{
+                font-family: {FONT_FAMILY_MONO};
+                color: {COLOR_TEXT_DEFAULT};
+            }}
+            #CardWidget {{
+                background-color: {COLOR_BG_CARD};
+                border: 2px solid {COLOR_BORDER};
+                border-radius: 12px; /* rounded-xl */
+                /* Basic shadow effect using offset border - real shadow is complex */
+                /* border-bottom-width: 4px; */
+                /* border-right-width: 4px; */
+            }}
+            #CardTitle {{
+                font-size: {FONT_SIZE_LG}pt;
+                font-weight: bold;
+                color: {COLOR_TEXT_LG};
+                padding-bottom: 4px;
+            }}
+            #HeaderLine {{
+                border: none;
+                border-top: 2px solid {COLOR_BORDER};
+                margin-top: 8px; /* mt-2 */
+                margin-bottom: 4px; /* mb-1 */
+            }}
+
+            /* PieChartWidget styling if needed (e.g., background) */
+            PieChartWidget {{
+                 background-color: transparent; /* Make sure it doesn't obscure card bg*/
+            }}
+
+            #TotalStatsLabel {{
+                font-size: {FONT_SIZE_XS}pt;
+                font-weight: bold;
+                /* mb-6 handled by layout spacing */
+            }}
+
+            #StatBlock {{
+                background-color: {COLOR_BG_CARD}; /* bg-white */
+                border: 2px solid {COLOR_BORDER};
+                border-radius: 6px; /* rounded-md */
+                /* Add a subtle inner shadow/border if needed */
+                /* box-shadow: inset 0 1px 2px 0 rgba(0, 0, 0, 0.05); - hard in QSS */
+            }}
+            #StatBlockTitle {{
+                font-size: {FONT_SIZE_SM}pt;
+                font-weight: bold;
+                margin-bottom: 2px; /* mb-1 */
+            }}
+            #StatBlockLine {{
+                border: none;
+                border-top: 1px solid {COLOR_BORDER}; /* border-b-2 (adjust thickness if needed) */
+                margin-bottom: 4px; /* mb-2 */
+            }}
+            #StatBlockValue {{
+                font-size: {FONT_SIZE_4XL}pt; /* text-4xl */
+                font-weight: 600; /* font-semibold */
+                /* color is set inline for simplicity */
+                /* margin-top: 24px; mt-6 handled by layout spacing */
+            }}
+
+            /* Example using property selector (alternative to inline style for value color)
+            #StatBlockValue[statType="detected"] {{ color: {COLOR_TEXT_VPN_DETECTED}; }}
+            #StatBlockValue[statType="not_detected"] {{ color: {COLOR_TEXT_VPN_NOT_DETECTED}; }}
+            */
+        """
+        self.setStyleSheet(styles)
+
+    # --- Mock Toast ---
+    def _show_message(self, title, description):
+        # Basic replacement for the toast
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(title)
+        msg_box.setText(description)
+        msg_box.setStyleSheet(f"""
+            QMessageBox {{
+                font-family: {FONT_FAMILY_MONO};
+                font-size: {FONT_SIZE_SM}pt;
+            }}
+            QLabel {{ color: {COLOR_TEXT_DEFAULT}; }}
+            QPushButton {{ /* Basic button style */
+                background-color: #e5e7eb; border: 1px solid #9ca3af;
+                padding: 5px 10px; border-radius: 3px; min-width: 60px; }}
+            QPushButton:hover {{ background-color: #d1d5db; }}
+        """)
+        msg_box.exec()
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = VPNDetectionStatsDashboardYaakai()
+    window.show()
+    sys.exit(app.exec())
+
+#profile page .py 
+import sys
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFrame, QComboBox, QMessageBox, QSizePolicy, QSpacerItem, QLineEdit
+)
+from PyQt6.QtGui import QFont, QPalette, QColor, QIcon # QIcon might be needed for dropdown arrow styling later
+from PyQt6.QtCore import Qt, QSize
+
+# --- Color Palette ---
+COLOR_BG_MAIN = "#f3f4f6"  # gray-100
+COLOR_BG_CARD = "#ffffff"
+COLOR_BORDER = "#000000"
+COLOR_BG_FIELD = "#f9fafb" # gray-50
+COLOR_TEXT_DEFAULT = "#000000"
+COLOR_TEXT_LG = "#111827" # gray-900 approx for title?
+COLOR_TEXT_LABEL = "#1f2937" # gray-800 approx for labels
+COLOR_TEXT_MUTED = "#4b5563" # gray-600 for logout link
+COLOR_TEXT_LINK = "#2563eb" # blue-600
+COLOR_BUTTON_EDIT_BG = "#FFD325"
+COLOR_BUTTON_EDIT_HOVER = "#E6BE00"
+COLOR_BUTTON_EDIT_TEXT = "#000000"
+COLOR_BUTTON_DELETE_BG = "#FC0A0A"
+COLOR_BUTTON_DELETE_HOVER = "#D30808"
+COLOR_BUTTON_DELETE_TEXT = "#ffffff"
+
+# --- Font Sizes ---
+FONT_SIZE_XS = 9
+FONT_SIZE_SM = 10
+FONT_SIZE_MD = 12 # Profile title
+FONT_SIZE_LG = 14 # Main title
+
+FONT_FAMILY_MONO = "Consolas, Courier New, monospace"
+
+# --- Mock User Data ---
+INITIAL_PROFILE = {
+    'username': 'username123',
+    'email': 'user@example.com',
+    'phone': '+1 (555) 123-4567',
+    'country': 'United States',
+    'userId': 'CB-USER-12345',
+}
+
+# --- Country List ---
+COUNTRIES = [
+    "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Antigua and Barbuda", "Argentina", "Armenia", "Australia", "Austria",
+    "Azerbaijan", "Bahamas", "Bahrain", "Bangladesh", "Barbados", "Belarus", "Belgium", "Belize", "Benin", "Bhutan",
+    "Bolivia", "Bosnia and Herzegovina", "Botswana", "Brazil", "Brunei", "Bulgaria", "Burkina Faso", "Burundi", "Cabo Verde", "Cambodia",
+    "Cameroon", "Canada", "Central African Republic", "Chad", "Chile", "China", "Colombia", "Comoros", "Congo (Congo-Brazzaville)", "Costa Rica",
+    "Croatia", "Cuba", "Cyprus", "Czechia (Czech Republic)", "Democratic Republic of the Congo", "Denmark", "Djibouti", "Dominica", "Dominican Republic", "Ecuador",
+    "Egypt", "El Salvador", "Equatorial Guinea", "Eritrea", "Estonia", "Eswatini (fmr. Swaziland)", "Ethiopia", "Fiji", "Finland", "France",
+    "Gabon", "Gambia", "Georgia", "Germany", "Ghana", "Greece", "Grenada", "Guatemala", "Guinea", "Guinea-Bissau",
+    "Guyana", "Haiti", "Honduras", "Hungary", "Iceland", "India", "Indonesia", "Iran", "Iraq", "Ireland",
+    "Israel", "Italy", "Jamaica", "Japan", "Jordan", "Kazakhstan", "Kenya", "Kiribati", "Kuwait", "Kyrgyzstan",
+    "Laos", "Latvia", "Lebanon", "Lesotho", "Liberia", "Libya", "Liechtenstein", "Lithuania", "Luxembourg", "Madagascar",
+    "Malawi", "Malaysia", "Maldives", "Mali", "Malta", "Marshall Islands", "Mauritania", "Mauritius", "Mexico", "Micronesia",
+    "Moldova", "Monaco", "Mongolia", "Montenegro", "Morocco", "Mozambique", "Myanmar (formerly Burma)", "Namibia", "Nauru", "Nepal",
+    "Netherlands", "New Zealand", "Nicaragua", "Niger", "Nigeria", "North Korea", "North Macedonia (formerly Macedonia)", "Norway", "Oman", "Pakistan",
+    "Palau", "Palestine State", "Panama", "Papua New Guinea", "Paraguay", "Peru", "Philippines", "Poland", "Portugal", "Qatar",
+    "Romania", "Russia", "Rwanda", "Saint Kitts and Nevis", "Saint Lucia", "Saint Vincent and the Grenadines", "Samoa", "San Marino", "Sao Tome and Principe", "Saudi Arabia",
+    "Senegal", "Serbia", "Seychelles", "Sierra Leone", "Singapore", "Slovakia", "Slovenia", "Solomon Islands", "Somalia", "South Africa",
+    "South Korea", "South Sudan", "Spain", "Sri Lanka", "Sudan", "Suriname", "Sweden", "Switzerland", "Syria", "Taiwan",
+    "Tajikistan", "Tanzania", "Thailand", "Timor-Leste", "Togo", "Tonga", "Trinidad and Tobago", "Tunisia", "Turkey", "Turkmenistan",
+    "Tuvalu", "Uganda", "Ukraine", "United Arab Emirates", "United Kingdom", "United States", "Uruguay", "Uzbekistan", "Vanuatu", "Vatican City",
+    "Venezuela", "Vietnam", "Yemen", "Zambia", "Zimbabwe"
+]
+
+# --- Main Profile Widget ---
+class RetroProfilePageYaakai(QWidget):
+    def __init__(self):
+        super().__init__()
+        # Store mutable profile data if needed for updates (like country)
+        self.profile_data = INITIAL_PROFILE.copy()
+        self._init_ui()
+        self._apply_styles()
+
+    def _init_ui(self):
+        self.setWindowTitle("Checkblock Profile")
+        self.setMinimumSize(600, 750) # Window size
+
+        # Overall layout centering the card
+        main_layout = QHBoxLayout(self)
+        main_layout.addStretch(1)
+        main_layout.addWidget(self._create_card())
+        main_layout.addStretch(1)
+
+        # Set overall background
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(COLOR_BG_MAIN))
+        self.setAutoFillBackground(True)
+        self.setPalette(palette)
+
+    def _create_card(self):
+        card_widget = QWidget()
+        card_widget.setObjectName("CardWidget")
+        card_widget.setFixedWidth(505)
+
+        card_layout = QVBoxLayout(card_widget)
+        card_layout.setContentsMargins(24, 24, 24, 24) # p-6
+        card_layout.setSpacing(0) # Control spacing manually or with specific styles/spacers
+
+        # --- Header ---
+        header_layout = QVBoxLayout()
+        header_layout.setSpacing(8)
+        header_layout.setContentsMargins(8, 0, 8, 12) # px-2 mb-3 approx
+
+        title_label = QLabel("checkblock")
+        title_label.setObjectName("CardTitle")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_layout.addWidget(title_label)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setObjectName("HeaderLine")
+        header_layout.addWidget(line)
+
+        # 65px empty space
+        header_layout.addSpacerItem(QSpacerItem(20, 65, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
+        card_layout.addLayout(header_layout)
+        card_layout.addSpacing(10) # Spacing after header block
+
+        # --- Profile Title ---
+        profile_title = QLabel("Profile")
+        profile_title.setObjectName("ProfileTitle")
+        profile_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(profile_title)
+        card_layout.addSpacing(24) # mb-6
+
+        # --- Profile Content Area ---
+        card_layout.addWidget(self._create_profile_content_area())
+        card_layout.addSpacing(24) # mb-6
+
+        # --- Action Buttons ---
+        action_buttons_layout = QHBoxLayout()
+        action_buttons_layout.setContentsMargins(16, 0, 16, 0) # px-4 equivalent
+        action_buttons_layout.setSpacing(24) # gap-6
+        action_buttons_layout.setAlignment(Qt.AlignmentFlag.AlignCenter) # Center buttons horizontally
+
+        edit_button = QPushButton("Edit profile")
+        edit_button.setObjectName("EditButton")
+        edit_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        edit_button.clicked.connect(self._handle_edit)
+
+        delete_button = QPushButton("Delete profile")
+        delete_button.setObjectName("DeleteButton")
+        delete_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        delete_button.clicked.connect(self._handle_delete)
+
+        action_buttons_layout.addWidget(edit_button)
+        action_buttons_layout.addWidget(delete_button)
+        card_layout.addLayout(action_buttons_layout)
+        card_layout.addSpacing(24) # mb-6
+
+        # --- Logout Link ---
+        logout_button = QPushButton("Not this account? logout")
+        logout_button.setObjectName("LogoutLink")
+        logout_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        logout_button.clicked.connect(self._handle_logout)
+        card_layout.addWidget(logout_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        card_layout.addStretch(1) # Push content up if window is tall
+
+        # Set fixed size policy vertically if content is small
+        card_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding)
+
+
+        return card_widget
+
+    def _create_profile_content_area(self):
+        content_area = QWidget()
+        content_area.setObjectName("ProfileContentArea")
+
+        layout = QVBoxLayout(content_area)
+        layout.setContentsMargins(16, 16, 16, 16) # p-4
+        layout.setSpacing(16) # Consistent spacing between items (mb-4)
+
+        # --- Username ---
+        layout.addWidget(self._create_display_field("User name:", self.profile_data['username']))
+
+        # --- Phone ---
+        layout.addWidget(self._create_display_field("Registered phone number:", self.profile_data['phone']))
+
+        # --- Email ---
+        layout.addWidget(self._create_display_field("Registered email-id:", self.profile_data['email']))
+
+        # --- Country / User ID Row ---
+        country_user_row = QHBoxLayout()
+        country_user_row.setSpacing(16) # gap-4
+
+        # Country Column
+        country_col = QVBoxLayout()
+        country_col.setSpacing(4) # mb-1 between label and widget
+        country_label = QLabel("country / Region")
+        country_label.setObjectName("FieldLabel")
+        self.country_combo = QComboBox()
+        self.country_combo.setObjectName("CountryComboBox")
+        self.country_combo.addItems(COUNTRIES)
+        self.country_combo.setCurrentText(self.profile_data['country']) # Set initial value
+        self.country_combo.currentTextChanged.connect(self._handle_country_change)
+        self.country_combo.setCursor(Qt.CursorShape.PointingHandCursor) # Indicate it's interactive
+
+        country_col.addWidget(country_label)
+        country_col.addWidget(self.country_combo)
+        country_user_row.addLayout(country_col, stretch=1) # Give equal space (flex-1)
+
+        # User ID Column
+        user_id_col = QVBoxLayout()
+        user_id_col.setSpacing(4)
+        user_id_label = QLabel("user ID")
+        user_id_label.setObjectName("FieldLabel")
+        user_id_display = self._create_display_field_widget(self.profile_data['userId'])
+
+        user_id_col.addWidget(user_id_label)
+        user_id_col.addWidget(user_id_display)
+        country_user_row.addLayout(user_id_col, stretch=1) # Give equal space
+
+        layout.addLayout(country_user_row) # Add the row layout
+
+        # --- Change Password Link ---
+        change_password_button = QPushButton("Change Password")
+        change_password_button.setObjectName("ChangePasswordLink")
+        change_password_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        change_password_button.clicked.connect(self._handle_change_password)
+        layout.addWidget(change_password_button, alignment=Qt.AlignmentFlag.AlignCenter) # mb-2 handled by overall spacing
+
+        return content_area
+
+    # Helper to create the Label + styled Display Widget structure
+    def _create_display_field(self, label_text, value_text):
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(4) # mb-1 between label and field
+
+        label = QLabel(label_text)
+        label.setObjectName("FieldLabel")
+
+        value_widget = self._create_display_field_widget(value_text)
+
+        layout.addWidget(label)
+        layout.addWidget(value_widget)
+
+        return container
+
+    # Helper to create just the styled display widget (QLabel)
+    def _create_display_field_widget(self, value_text):
+        value_label = QLabel(value_text)
+        value_label.setObjectName("DisplayField")
+        value_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        value_label.setWordWrap(False) # Prevent wrapping
+        # Elide text if it overflows (like text-ellipsis)
+        fm = value_label.fontMetrics()
+        elided_text = fm.elidedText(value_text, Qt.TextElideMode.ElideRight, value_label.width() - 10) # Adjust width if needed
+        value_label.setText(elided_text)
+        # TODO: Consider connecting a resize event to re-elide text if needed, complex. Usually fixed width is ok.
+        value_label.setToolTip(value_text) # Show full text on hover
+
+        return value_label
+
+    # --- Signal Handlers ---
+    def _handle_edit(self):
+        self._show_toast("Edit Profile", "Edit profile action triggered.")
+
+    def _handle_delete(self):
+        reply = QMessageBox.question(self, 'Confirm Delete',
+                                     'Are you sure you want to delete your profile? This action cannot be undone.',
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No) # Default to No
+        if reply == QMessageBox.StandardButton.Yes:
+            self._show_toast("Delete Profile", "Profile delete requested!") # Add variant="destructive" if you style QMessageBox
+
+    def _handle_change_password(self):
+        self._show_toast("Change Password", "Change password action triggered.")
+
+    def _handle_logout(self):
+        self._show_toast("Logout", "Logout action triggered.")
+
+    def _handle_country_change(self, new_country):
+        self.profile_data['country'] = new_country
+        print(f"Country changed to: {new_country}") # For debugging
+        # No visual update needed here unless other parts depend on this
+
+    # --- Mock Toast ---
+    def _show_toast(self, title, description, variant="default"):
+         # Basic replacement for the toast
+        msg_box = QMessageBox(self) # Parent to self
+        msg_box.setWindowTitle(title)
+        msg_box.setText(description)
+
+        # Minimal styling for the messagebox itself
+        msg_box.setStyleSheet(f"""
+            QMessageBox {{
+                font-family: {FONT_FAMILY_MONO};
+                font-size: {FONT_SIZE_SM}pt;
+            }}
+            QLabel {{ /* Text inside */
+                 color: {COLOR_TEXT_DEFAULT};
+                 font-size: {FONT_SIZE_SM}pt; /* Ensure text size */
+            }}
+            QPushButton {{ /* OK button */
+                background-color: #e5e7eb;
+                border: 1px solid #9ca3af;
+                padding: 5px 15px;
+                border-radius: 3px;
+                min-width: 60px;
+                font-size: {FONT_SIZE_SM}pt;
+            }}
+            QPushButton:hover {{
+                background-color: #d1d5db;
+            }}
+         """)
+
+        # You could add icons based on variant if needed
+        # if variant == "destructive":
+        #     msg_box.setIcon(QMessageBox.Icon.Warning)
+        # else:
+        #     msg_box.setIcon(QMessageBox.Icon.Information)
+
+        msg_box.exec()
+
+
+    # --- Styling (QSS) ---
+    def _apply_styles(self):
+        styles = f"""
+            QWidget {{
+                font-family: {FONT_FAMILY_MONO};
+                color: {COLOR_TEXT_DEFAULT};
+            }}
+            #CardWidget {{
+                background-color: {COLOR_BG_CARD};
+                border: 2px solid {COLOR_BORDER};
+                border-radius: 12px; /* rounded-xl */
+                /* box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); صعب في QSS */
+            }}
+            #CardTitle {{
+                font-size: {FONT_SIZE_LG}pt;
+                font-weight: bold;
+                color: {COLOR_TEXT_LG};
+                padding-bottom: 4px;
+            }}
+            #HeaderLine {{
+                border: none;
+                border-top: 2px solid {COLOR_BORDER};
+                margin-top: 8px; /* mt-2 */
+                margin-bottom: 4px; /* mb-1 */
+            }}
+            #ProfileTitle {{
+                font-size: {FONT_SIZE_MD}pt;
+                font-weight: 600; /* font-semibold */
+                color: {COLOR_TEXT_LG};
+                 /* mb-6 handled by layout spacing */
+            }}
+            #ProfileContentArea {{
+                background-color: {COLOR_BG_CARD}; /* bg-white */
+                border: 2px solid {COLOR_BORDER};
+                border-radius: 6px; /* rounded-md */
+                 /* padding is handled by layout margins */
+                 /* mb-6 handled by layout spacing */
+            }}
+            #FieldLabel {{
+                font-size: {FONT_SIZE_SM}pt;
+                font-weight: bold;
+                color: {COLOR_TEXT_LABEL};
+                /* mb-1 handled by layout spacing */
+            }}
+            #DisplayField {{
+                background-color: {COLOR_BG_FIELD};
+                border: 1px solid {COLOR_BORDER}; /* Black border */
+                border-radius: 4px; /* rounded */
+                font-size: {FONT_SIZE_SM}pt;
+                min-height: 26px; /* Approx h-9 (36px), adjust padding */
+                max-height: 26px;
+                padding: 4px 8px; /* px-3 py-1 approx */
+                color: {COLOR_TEXT_DEFAULT};
+                /* overflow/ellipsis handled in Python code */
+            }}
+
+            #CountryComboBox {{
+                background-color: {COLOR_BG_FIELD};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 4px;
+                font-size: {FONT_SIZE_SM}pt;
+                min-height: 26px;
+                max-height: 26px;
+                padding: 4px 8px;
+                /* Styling the dropdown arrow is complex and platform-dependent */
+                /* appearance: none; - Not directly mappable */
+            }}
+            #CountryComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 15px;
+                border-left-width: 1px;
+                border-left-color: {COLOR_BORDER};
+                border-left-style: solid;
+                border-top-right-radius: 3px;
+                border-bottom-right-radius: 3px;
+            }}
+             #CountryComboBox::down-arrow {{
+                 /* You can use an image for a custom arrow */
+                 /* image: url(path/to/down_arrow.png); */
+                 width: 7px;
+                 height: 7px;
+                 /* Basic triangle rendering: */
+                 /* border: 3px solid transparent; */
+                 /* border-top-color: {COLOR_TEXT_DEFAULT}; */
+                 /* margin: auto; */
+            }}
+            #CountryComboBox:focus {{
+                 border: 1px solid {COLOR_TEXT_LINK}; /* Mimic focus ring */
+            }}
+
+            #ChangePasswordLink {{
+                font-size: {FONT_SIZE_SM}pt;
+                font-weight: 300; /* font-light */
+                color: {COLOR_TEXT_LINK};
+                text-decoration: none; /* No underline by default */
+                border: none;
+                background-color: transparent;
+                padding: 2px; /* Minimal padding */
+                /* mb-2 handled by layout spacing */
+            }}
+            #ChangePasswordLink:hover {{
+                text-decoration: underline;
+            }}
+
+            /* Action Buttons Base Style */
+            #EditButton, #DeleteButton {{
+                font-weight: bold;
+                font-size: {FONT_SIZE_XS}pt; /* text-xs */
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 20px; /* rounded-full (half of height approx) */
+                padding: 8px 24px; /* py-2 px-6 */
+                min-height: 24px; /* Approx h-10 (40px) including padding/border */
+                max-height: 24px;
+                 /* transition: background-color 0.15s ease-in-out; - Not possible in QSS */
+                /* shadow-sm - Not directly possible */
+            }}
+            /* Edit Button Specific */
+            #EditButton {{
+                background-color: {COLOR_BUTTON_EDIT_BG};
+                color: {COLOR_BUTTON_EDIT_TEXT};
+            }}
+            #EditButton:hover {{
+                background-color: {COLOR_BUTTON_EDIT_HOVER};
+            }}
+            /* Delete Button Specific */
+            #DeleteButton {{
+                 background-color: {COLOR_BUTTON_DELETE_BG};
+                 color: {COLOR_BUTTON_DELETE_TEXT};
+            }}
+             #DeleteButton:hover {{
+                 background-color: {COLOR_BUTTON_DELETE_HOVER};
+             }}
+
+            #LogoutLink {{
+                 font-size: {FONT_SIZE_SM}pt;
+                 font-weight: 300; /* font-light */
+                 color: {COLOR_TEXT_MUTED};
+                 text-decoration: none;
+                 border: none;
+                 background-color: transparent;
+                 padding: 2px;
+            }}
+            #LogoutLink:hover {{
+                 text-decoration: underline;
+            }}
+        """
+        self.setStyleSheet(styles)
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = RetroProfilePageYaakai()
+    window.show()
+    sys.exit(app.exec())
+
+#loginpage.py 
+
+import sys
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFrame, QComboBox, QMessageBox, QSizePolicy, QSpacerItem, QLineEdit
+)
+from PyQt6.QtGui import QFont, QPalette, QColor, QStandardItemModel, QStandardItem
+from PyQt6.QtCore import Qt, QSize
+
+# --- Color Palette ---
+COLOR_BG_MAIN = "#f3f4f6"  # gray-100
+COLOR_BG_CARD = "#ffffff"
+COLOR_BORDER = "#000000"
+COLOR_BG_FIELD = "#f9fafb"  # gray-50
+COLOR_TEXT_DEFAULT = "#000000"
+COLOR_TEXT_LG = "#111827"  # gray-900 approx for title?
+COLOR_TEXT_LABEL = "#1f2937"  # gray-800 approx for labels
+COLOR_TEXT_PLACEHOLDER = "#9ca3af"  # gray-400
+COLOR_BUTTON_SUBMIT_BG = "#FFD325"
+COLOR_BUTTON_SUBMIT_HOVER = "#E6BE00"
+COLOR_BUTTON_SUBMIT_TEXT = "#000000"
+
+# --- Font Sizes ---
+FONT_SIZE_XS = 9
+FONT_SIZE_SM = 10
+FONT_SIZE_MD = 12  # Login title
+FONT_SIZE_LG = 14  # Main title
+
+FONT_FAMILY_MONO = "Consolas, Courier New, monospace"
+
+# --- Countries Data ---
+# Store as list of dictionaries for potential future use of code/dial_code
+COUNTRIES_DATA = [
+    {'name': 'United States', 'code': 'US', 'dial_code': '+1'},
+    {'name': 'Canada', 'code': 'CA', 'dial_code': '+1'},
+    {'name': 'India', 'code': 'IN', 'dial_code': '+91'},
+    {'name': 'United Kingdom', 'code': 'GB', 'dial_code': '+44'},
+    {'name': 'Germany', 'code': 'DE', 'dial_code': '+49'},
+    {'name': 'France', 'code': 'FR', 'dial_code': '+33'},
+    {'name': 'Australia', 'code': 'AU', 'dial_code': '+61'},
+    {'name': 'Brazil', 'code': 'BR', 'dial_code': '+55'},
+    {'name': 'Japan', 'code': 'JP', 'dial_code': '+81'},
+    {'name': 'South Africa', 'code': 'ZA', 'dial_code': '+27'},
+]
+# For display in ComboBox, format like React example
+COUNTRY_DISPLAY_LIST = [
+                           "Select your country",  # Placeholder text
+                       ] + [f"{c['name']} ({c['code']})" for c in COUNTRIES_DATA]
+# Simple mapping from display text back to country name (if needed, e.g., for submission)
+COUNTRY_NAME_MAP = {f"{c['name']} ({c['code']})": c['name'] for c in COUNTRIES_DATA}
+
+
+# --- Main Login Widget ---
+class LoginYaakaiAccount(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._init_ui()
+        self._apply_styles()
+
+    def _init_ui(self):
+        self.setWindowTitle("Checkblock Login")
+        self.setMinimumSize(600, 650)  # Adjusted window size
+
+        # Overall layout centering the card
+        main_layout = QHBoxLayout(self)
+        main_layout.addStretch(1)
+        main_layout.addWidget(self._create_card())
+        main_layout.addStretch(1)
+
+        # Set overall background
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(COLOR_BG_MAIN))
+        self.setAutoFillBackground(True)
+        self.setPalette(palette)
+
+    def _create_card(self):
+        card_widget = QWidget()
+        card_widget.setObjectName("CardWidget")
+        card_widget.setFixedWidth(505)
+
+        card_layout = QVBoxLayout(card_widget)
+        card_layout.setContentsMargins(24, 24, 24, 24)  # p-6
+        card_layout.setSpacing(0)  # Control spacing via spacers or item margins
+
+        # --- Header ---
+        header_layout = QVBoxLayout()
+        header_layout.setSpacing(8)
+        header_layout.setContentsMargins(8, 0, 8, 12)  # px-2 mb-3 approx
+
+        title_label = QLabel("checkblock")
+        title_label.setObjectName("CardTitle")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_layout.addWidget(title_label)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setObjectName("HeaderLine")
+        header_layout.addWidget(line)
+
+        # 65px empty space
+        header_layout.addSpacerItem(QSpacerItem(20, 65, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
+        card_layout.addLayout(header_layout)
+        card_layout.addSpacing(10)
+
+        # --- Login Title ---
+        login_title = QLabel("Login to your yaakai account")
+        login_title.setObjectName("LoginTitle")
+        login_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(login_title)
+        card_layout.addSpacing(24)  # mb-6
+
+        # --- Form Area ---
+        form_layout = QVBoxLayout()
+        form_layout.setSpacing(16)  # space-y-4
+
+        # Email
+        form_layout.addLayout(self._create_input_field(
+            label_text="Email ID :",
+            input_object_name="EmailInput",
+            placeholder="user@example.com",
+            is_password=False
+        ))
+
+        # Password
+        form_layout.addLayout(self._create_input_field(
+            label_text="Password :",
+            input_object_name="PasswordInput",
+            placeholder="********",
+            is_password=True
+        ))
+
+        # Country
+        form_layout.addLayout(self._create_country_field())
+
+        # Phone
+        form_layout.addLayout(self._create_input_field(
+            label_text="Phone number :",
+            input_object_name="PhoneInput",
+            placeholder="+1 (555) 123-4567",
+            is_password=False,
+            input_type="tel"  # Informative, QLineEdit handles it as text
+        ))
+
+        card_layout.addLayout(form_layout)
+        # Add extra space before the button (pt-4 equivalent = 16px)
+        # The form layout already has 16px spacing, so add it here
+        card_layout.addSpacing(16)
+
+        # --- Submit Button ---
+        submit_button = QPushButton("Login to your account")
+        submit_button.setObjectName("SubmitButton")
+        submit_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        submit_button.clicked.connect(self._handle_login)
+        card_layout.addWidget(submit_button)
+
+        card_layout.addStretch(1)  # Push elements up
+
+        card_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+
+        return card_widget
+
+    # Helper for Label + QLineEdit
+    def _create_input_field(self, label_text, input_object_name, placeholder, is_password=False, input_type="text"):
+        layout = QVBoxLayout()
+        layout.setSpacing(4)  # mb-1 between label and input
+
+        label = QLabel(label_text)
+        label.setObjectName("FieldLabel")
+        layout.addWidget(label)
+
+        line_edit = QLineEdit()
+        line_edit.setObjectName(input_object_name)
+        line_edit.setPlaceholderText(placeholder)
+        if is_password:
+            line_edit.setEchoMode(QLineEdit.EchoMode.Password)
+
+        # Store reference for easy access in _handle_login
+        setattr(self, f"{input_object_name.lower()}_field", line_edit)
+
+        layout.addWidget(line_edit)
+        return layout
+
+    # Helper specific for Country ComboBox field
+    def _create_country_field(self):
+        layout = QVBoxLayout()
+        layout.setSpacing(4)
+
+        label = QLabel("Country / region :")
+        label.setObjectName("FieldLabel")
+        layout.addWidget(label)
+
+        self.country_combo = QComboBox()
+        self.country_combo.setObjectName("CountryComboBox")
+
+        # Use a model to properly handle placeholder appearance and disabling
+        model = QStandardItemModel()
+
+        # Add placeholder item
+        placeholder_item = QStandardItem(COUNTRY_DISPLAY_LIST[0])
+        placeholder_item.setEnabled(False)  # Make it non-selectable
+        placeholder_item.setData(QColor(COLOR_TEXT_PLACEHOLDER), Qt.ItemDataRole.ForegroundRole)  # Style it gray
+        model.appendRow(placeholder_item)
+
+        # Add actual country items
+        for country_display_text in COUNTRY_DISPLAY_LIST[1:]:
+            item = QStandardItem(country_display_text)
+            model.appendRow(item)
+
+        self.country_combo.setModel(model)
+        self.country_combo.setCurrentIndex(0)  # Start with placeholder selected
+        self.country_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout.addWidget(self.country_combo)
+        return layout
+
+    # --- Signal Handlers ---
+    def _handle_login(self):
+        email = self.emailinput_field.text().strip()
+        password = self.passwordinput_field.text()  # Keep password as is
+        country_index = self.country_combo.currentIndex()
+        country_display_text = self.country_combo.currentText()  # Text like "United States (US)"
+        phone = self.phoneinput_field.text().strip()
+
+        # Get the actual country name (without code), handling the placeholder
+        country_name = ""
+        if country_index != 0:  # Not the placeholder
+            country_name = COUNTRY_NAME_MAP.get(country_display_text, "")  # Lookup name from display text
+
+        # --- Validation ---
+        if not email or not password:
+            self._show_toast("Missing Information", "Please enter both email and password.", variant="destructive")
+            return
+        # Check if placeholder is selected (index 0)
+        if country_index == 0:
+            self._show_toast("Missing Information", "Please select your country.", variant="destructive")
+            return
+
+        # If validation passes
+        self._show_toast("Login Attempt", f"Email: {email}\nCountry: {country_name}\nPhone: {phone}")
+        print(f"Login credentials: Email={email}, Password=***, Country={country_name}, Phone={phone}")
+        # Here you would typically send the data to a backend/API
+
+    # --- Mock Toast ---
+    def _show_toast(self, title, description, variant="default"):
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(title)
+        msg_box.setText(description)
+
+        # Minimal styling for the messagebox itself
+        msg_box.setStyleSheet(f"""
+            QMessageBox {{
+                font-family: {FONT_FAMILY_MONO};
+                font-size: {FONT_SIZE_SM}pt;
+            }}
+            QLabel {{ /* Text inside */
+                 color: {COLOR_TEXT_DEFAULT};
+                 font-size: {FONT_SIZE_SM}pt;
+            }}
+            QPushButton {{ /* OK button */
+                background-color: #e5e7eb;
+                border: 1px solid {COLOR_BORDER}; /* Match theme border */
+                padding: 5px 15px;
+                border-radius: 12px; /* Rounded */
+                min-width: 60px;
+                font-size: {FONT_SIZE_SM}pt;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: #d1d5db;
+            }}
+         """)
+
+        if variant == "destructive":
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+        else:
+            msg_box.setIcon(QMessageBox.Icon.Information)
+
+        msg_box.exec()
+
+    # --- Styling (QSS) ---
+    def _apply_styles(self):
+        # Style sheet using constants defined above
+        styles = f"""
+            QWidget {{
+                font-family: {FONT_FAMILY_MONO};
+                color: {COLOR_TEXT_DEFAULT};
+            }}
+            #CardWidget {{
+                background-color: {COLOR_BG_CARD};
+                border: 2px solid {COLOR_BORDER};
+                border-radius: 12px; /* rounded-xl */
+            }}
+            #CardTitle {{
+                font-size: {FONT_SIZE_LG}pt;
+                font-weight: bold;
+                color: {COLOR_TEXT_LG};
+                padding-bottom: 4px;
+            }}
+            #HeaderLine {{
+                border: none;
+                border-top: 2px solid {COLOR_BORDER};
+                margin-top: 8px; /* mt-2 */
+                margin-bottom: 4px; /* mb-1 */
+            }}
+            #LoginTitle {{
+                font-size: {FONT_SIZE_MD}pt;
+                font-weight: 600; /* font-semibold */
+                color: {COLOR_TEXT_LG};
+                 /* mb-6 handled by layout spacing */
+            }}
+            #FieldLabel {{
+                font-size: {FONT_SIZE_SM}pt;
+                font-weight: bold;
+                color: {COLOR_TEXT_LABEL};
+                /* mb-1 handled by layout spacing */
+            }}
+
+            /* Input Fields (QLineEdit) */
+            QLineEdit {{
+                background-color: {COLOR_BG_FIELD};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 4px; /* rounded */
+                font-size: {FONT_SIZE_SM}pt;
+                /* Adjusted height and padding for h-10 */
+                min-height: 28px; 
+                max-height: 28px;
+                padding: 5px 12px; /* px-3 py-2 approx */
+                color: {COLOR_TEXT_DEFAULT};
+            }}
+             QLineEdit:focus {{
+                 border: 1px solid #4338ca; /* Simulate ring like ring-black - using a dark indigo */
+             }}
+             QLineEdit::placeholder {{
+                 color: {COLOR_TEXT_PLACEHOLDER};
+                 font-style: normal; /* Ensure placeholder isn't italicized by default */
+                 font-size: {FONT_SIZE_SM}pt;
+             }}
+
+            /* Country ComboBox */
+            #CountryComboBox {{
+                background-color: {COLOR_BG_FIELD};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 4px;
+                font-size: {FONT_SIZE_SM}pt;
+                /* Match QLineEdit height/padding */
+                min-height: 28px;
+                max-height: 28px;
+                padding: 5px 12px;
+                 /* appearance: none; - Not directly mappable */
+            }}
+            /* Ensure combo box text color isn't placeholder color unless it's index 0 */
+            #CountryComboBox {{ color: {COLOR_TEXT_DEFAULT}; }} /* Default text color */
+            #CountryComboBox:!enabled {{ color: {COLOR_TEXT_PLACEHOLDER}; }} /* Might style if disabled */
+
+            #CountryComboBox QAbstractItemView {{ /* Style dropdown list */
+                background-color: {COLOR_BG_CARD};
+                border: 1px solid {COLOR_BORDER};
+                font-size: {FONT_SIZE_SM}pt;
+                padding: 4px;
+                outline: 0px; /* Remove focus outline around list */
+                 selection-background-color: #e5e7eb; /* bg-gray-100 on hover/select */
+                 selection-color: {COLOR_TEXT_DEFAULT}; /* Ensure text readable on selection*/
+            }}
+             #CountryComboBox QAbstractItemView::item {{
+                 padding: 5px 10px; /* Item padding */
+                 min-height: 25px;
+             }}
+             /* Placeholder item styling is now handled via the model's ForegroundRole */
+
+            #CountryComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left-width: 1px;
+                border-left-color: {COLOR_BORDER};
+                border-left-style: solid;
+                border-top-right-radius: 3px;
+                border-bottom-right-radius: 3px;
+            }}
+             #CountryComboBox::down-arrow {{
+                 /* Leaving default arrow for simplicity */
+                 /* image: url(path/to/arrow.svg); */
+                 width: 10px;
+                 height: 10px;
+             }}
+            #CountryComboBox:focus {{ /* Focus on the combo box itself */
+                 border: 1px solid #4338ca; /* Match QLineEdit focus */
+            }}
+
+            /* Submit Button */
+            #SubmitButton {{
+                background-color: {COLOR_BUTTON_SUBMIT_BG};
+                color: {COLOR_BUTTON_SUBMIT_TEXT};
+                font-weight: bold;
+                font-size: {FONT_SIZE_SM}pt; /* text-sm */
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 20px; /* rounded-full (approx half of height) */
+                padding: 8px 24px; /* py-2 px-6 */
+                /* Match h-10 (40px) sizing */
+                min-height: 24px; 
+                max-height: 24px; 
+                /* transition/shadow ignored */
+            }}
+            #SubmitButton:hover {{
+                background-color: {COLOR_BUTTON_SUBMIT_HOVER};
+            }}
+        """
+        self.setStyleSheet(styles)
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = LoginYaakaiAccount()
+    window.show()
+    sys.exit(app.exec())
+
+#navigationbar.py
+
+import sys
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QPushButton, QHBoxLayout, QSizePolicy, QFrame,
+    QVBoxLayout
+)
+from PyQt6.QtGui import QFont, QPalette, QColor, QPainter, QPen, QBrush
+from PyQt6.QtCore import Qt, QRect, QPropertyAnimation, QEasingCurve, QSize, QTimer
+
+# --- Constants ---
+COLOR_BG_MAIN = "#f3f4f6"  # gray-100
+COLOR_NAV_BG = "#f9fafb"  # gray-50 (navbar container bg)
+COLOR_HIGHLIGHT_BG = "#FFD325"  # yellow for highlight
+COLOR_BORDER = "#000000"
+COLOR_TEXT_SELECTED = "#000000"
+COLOR_TEXT_NORMAL = "#374151"
+COLOR_TEXT_HOVER = "#000000"
+COLOR_BUTTON_HOVER_BG = "#e5e7eb"  # gray-200
+COLOR_ROUNDED_RECT_BORDER = "#000000"
+
+FONT_SIZE_XS = 9
+FONT_FAMILY_MONO = "Consolas, Courier New, monospace"
+
+ANIMATION_DURATION = 300
+OUTER_PADDING = 50
+ROUNDED_RECT_RADIUS = 50
+BORDER_WIDTH = 1
+
+NAV_ITEMS = [
+    {'id': 'main', 'label': 'Main page'},
+    {'id': 'dashboard', 'label': 'Dashboard'},
+    {'id': 'profile', 'label': 'Profile'},
+]
+
+
+class RoundedBorderWidget(QWidget):
+    """Widget that draws a rounded rectangle border around its contents"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        pen = QPen(QColor(COLOR_ROUNDED_RECT_BORDER), BORDER_WIDTH)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))  # No fill
+
+        # Draw rounded rectangle matching the widget's size
+        rect = self.rect().adjusted(1, 1, -1, -1)  # Adjust to prevent clipping
+        painter.drawRoundedRect(rect, ROUNDED_RECT_RADIUS, ROUNDED_RECT_RADIUS)
+
+
+class NavigationBarYaakai(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._current_page_id = NAV_ITEMS[0]['id']
+        self._buttons = {}
+        self._animation = None
+
+        # Store hover state
+        self._hover_button = None
+
+        self._init_ui()
+        self._apply_styles()
+
+        QTimer.singleShot(0, self._initial_highlight_position)
+
+    def _init_ui(self):
+        self.setObjectName("NavBarContainer")
+        self.setFixedHeight(42)
+
+        # Enable mouse tracking for hover effects
+        self.setMouseTracking(True)
+        for child in self.findChildren(QWidget):
+            child.setMouseTracking(True)
+
+        self.layout = QHBoxLayout(self)
+        self.layout.setContentsMargins(4, 4, 4, 4)
+        self.layout.setSpacing(4)
+
+        # Highlight widget for selected button
+        self.highlight_widget = QFrame(self)
+        self.highlight_widget.setObjectName("Highlight")
+        self.highlight_widget.lower()
+
+        # Hover highlight widget
+        self.hover_widget = QFrame(self)
+        self.hover_widget.setObjectName("HoverHighlight")
+        self.hover_widget.lower()
+        self.hover_widget.hide()
+
+        # Create buttons
+        for item in NAV_ITEMS:
+            button = QPushButton(item['label'])
+            button.setObjectName("NavButton")
+            button.setProperty("navId", item['id'])
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
+            # Install event filters for hover detection
+            button.installEventFilter(self)
+
+            button.clicked.connect(self._handle_button_click)
+            self.layout.addWidget(button)
+            self._buttons[item['id']] = button
+
+        self._update_button_styles()
+
+    def eventFilter(self, obj, event):
+        # Handle hover events
+        if event.type() == event.Type.Enter and obj in self._buttons.values():
+            self._handle_hover_enter(obj)
+        elif event.type() == event.Type.Leave and obj == self._hover_button:
+            self._handle_hover_leave()
+        return super().eventFilter(obj, event)
+
+    def _handle_hover_enter(self, button):
+        # Skip if this button is already selected
+        if button.property("navId") == self._current_page_id:
+            return
+
+        self._hover_button = button
+        self._update_hover_widget_position(button)
+        self._animate_hover_widget(show=True)
+
+    def _handle_hover_leave(self):
+        self._animate_hover_widget(show=False)
+        self._hover_button = None
+
+    def _update_hover_widget_position(self, button):
+        target_geom = self._get_target_geometry(button)
+        if target_geom:
+            self.hover_widget.setGeometry(target_geom)
+
+    def _animate_hover_widget(self, show=True):
+        if show:
+            # Show immediately if not visible
+            if not self.hover_widget.isVisible():
+                self.hover_widget.show()
+                self.hover_widget.raise_()
+                self.hover_widget.lower()
+
+            # Animate opacity for smooth appearance
+            self.hover_widget.setStyleSheet("""
+                QFrame#HoverHighlight {
+                    background-color: rgba(229, 231, 235, 200);
+                    border: none;
+                }
+            """)
+        else:
+            # Simply hide (no animation for leaving currently)
+            self.hover_widget.hide()
+
+    def _handle_button_click(self):
+        sender_button = self.sender()
+        if not sender_button:
+            return
+
+        new_page_id = sender_button.property("navId")
+        if new_page_id and new_page_id != self._current_page_id:
+            self._current_page_id = new_page_id
+            self._update_button_styles()
+            self._animate_highlight()
+            print(f"Navigated to: {self._current_page_id}")
+
+    def _update_button_styles(self):
+        for page_id, button in self._buttons.items():
+            is_selected = (page_id == self._current_page_id)
+            button.setProperty("selected", is_selected)
+            self.style().unpolish(button)
+            self.style().polish(button)
+
+    def _initial_highlight_position(self):
+        if not self.isVisible() or self._current_page_id not in self._buttons:
+            return
+
+        target_button = self._buttons[self._current_page_id]
+        if target_button.width() <= 1:
+            QTimer.singleShot(10, self._initial_highlight_position)
+            return
+
+        target_geom = self._get_target_geometry(target_button)
+        if target_geom:
+            self.highlight_widget.setGeometry(target_geom)
+            self.highlight_widget.show()
+            self.highlight_widget.raise_()
+            self.highlight_widget.lower()
+
+    def _get_target_geometry(self, target_button: QPushButton) -> QRect:
+        if not target_button or target_button.width() <= 1:
+            return QRect()
+
+        button_pos = target_button.pos()
+        button_size = target_button.size()
+
+        # Calculate highlight rectangle that perfectly matches button bounds
+        target_height = self.height() - self.layout.contentsMargins().top() - self.layout.contentsMargins().bottom()
+        target_width = button_size.width()
+        target_x = button_pos.x()
+        target_y = self.layout.contentsMargins().top()
+
+        return QRect(int(target_x), int(target_y), int(target_width), int(target_height))
+
+    def _animate_highlight(self):
+        if self._current_page_id not in self._buttons:
+            return
+
+        target_button = self._buttons[self._current_page_id]
+        target_geom = self._get_target_geometry(target_button)
+
+        if target_geom.isNull():
+            return
+
+        self.highlight_widget.show()
+        self.highlight_widget.raise_()
+        self.highlight_widget.lower()
+
+        if self._animation and self._animation.state() == QPropertyAnimation.State.Running:
+            self._animation.stop()
+
+        self._animation = QPropertyAnimation(self.highlight_widget, b"geometry")
+        self._animation.setDuration(ANIMATION_DURATION)
+        self._animation.setStartValue(self.highlight_widget.geometry())
+        self._animation.setEndValue(target_geom)
+        self._animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._animation.start()
+
+    def _apply_styles(self):
+        container_radius = self.height() // 2
+        inner_radius = container_radius - (self.layout.contentsMargins().top()) - 1
+
+        styles = f"""
+            /* Main container styles */
+            #NavBarContainer {{
+                background-color: {COLOR_NAV_BG};
+                border: 2px solid {COLOR_BORDER};
+                border-radius: {container_radius}px;
+            }}
+
+            /* Highlight widget for selected button */
+            #Highlight {{
+                background-color: {COLOR_HIGHLIGHT_BG};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: {inner_radius}px;
+            }}
+
+            /* Hover highlight widget */
+            #HoverHighlight {{
+                background-color: {COLOR_BUTTON_HOVER_BG};
+                border-radius: {inner_radius}px;
+            }}
+
+            /* Button styles */
+            #NavBarContainer QPushButton#NavButton {{
+                font-family: {FONT_FAMILY_MONO};
+                font-size: {FONT_SIZE_XS}pt;
+                font-weight: bold;
+                color: {COLOR_TEXT_NORMAL};
+                border: none;
+                background-color: transparent;
+                padding: 8px 16px;
+                border-radius: {inner_radius}px;
+                outline: none;
+                min-height: {self.height() - self.layout.contentsMargins().top() * 2 - 4}px;
+            }}
+
+            /* Button hover state - changes text color only */
+            #NavBarContainer QPushButton#NavButton:hover {{
+                color: {COLOR_TEXT_HOVER};
+            }}
+
+            /* Selected button state */
+            #NavBarContainer QPushButton#NavButton[selected="true"] {{
+                color: {COLOR_TEXT_SELECTED};
+                background-color: transparent;
+            }}
+        """
+        self.setStyleSheet(styles)
+
+
+class HomeWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Yaakai Navigation")
+        self.setGeometry(300, 300, 700, 300)
+
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(COLOR_BG_MAIN))
+        self.setAutoFillBackground(True)
+        self.setPalette(palette)
+
+        # Main layout
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # Create rounded border container
+        rounded_container = QWidget()
+        rounded_container.setObjectName("RoundedContainer")
+
+        # Create the rounded border widget
+        self.border_widget = RoundedBorderWidget(rounded_container)
+        self.border_widget.setGeometry(0, 0, 550, 150)  # Size includes padding
+
+        # Layout for the rounded container's contents
+        container_layout = QVBoxLayout(rounded_container)
+        container_layout.setContentsMargins(OUTER_PADDING, OUTER_PADDING, OUTER_PADDING, OUTER_PADDING)
+
+        # Add navbar to container
+        self.nav_bar = NavigationBarYaakai()
+        container_layout.addWidget(self.nav_bar, 0, Qt.AlignmentFlag.AlignCenter)
+
+        # Add container to main layout (centered)
+        main_layout.addWidget(rounded_container, 0, Qt.AlignmentFlag.AlignCenter)
+
+        # Set mono font
+        self.setFont(QFont(FONT_FAMILY_MONO))
+
+        # Adjust border widget position after layout
+        QTimer.singleShot(0, self._adjust_border_widget)
+
+    def _adjust_border_widget(self):
+        """Ensure border widget matches container size"""
+        container = self.findChild(QWidget, "RoundedContainer")
+        if container:
+            self.border_widget.setGeometry(0, 0, container.width(), container.height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._adjust_border_widget()
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = HomeWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+here is the main part - how the application should work .. the application must only i administravtive acces for windows and for linux with sudo access
+1st when the application is opened for the 1st time the loginpage.py will open and ask for the login credentails.. the email id, password, country(the country should be automatically detceted by system itself and if the country detected by the user is not the country of the user then h/she can change the country from the dropdown button of the country/region section ) after entering this and logging with the registered email id - the email id should be registered when downloading from the website if the email is not registered then the application should not open and if the user is opening for the 2nd time (the user already logged in ) then the login page should not open 
+and after the login process the mainpage.py will show up .. and when the mainpage is opened up then the vpn_detection.py code should start running .. and the output from the vpn_detection.py code should be displayed in the mainpage.py .. in the mainpage.py i have created 4 sections vpn status , public ip , local ip, activity log... in the out of the vpn_detection.py code  i have made the output like this only .. in the output of the vpn_detection.py there will be heading as vpn_status it should be displayed in the vpn status of the mainpage.py and the public ip - output from the vpn_detection.py this should be displayed under public ip in the mainpage.py and the local ip - output from the vpn_detection.py this should be displayed under the mainpage.py .. and there will be 3 buttons below all these if the start blocking button is clicked then the vpn_blocking button should start to run .. and the outputs from the vpn blocking should be stored in the activity log section of the mainpage.py and when the refresh button is clicked then the vpn_detection.py code should start again from the 1st and if the export button is clicked at the time of clicking what are the output that are dispalyed at the mainpage,py should be exported as html page and downloaded in the system storage ..all the values that are displayed on the mainpage.py should be stored in the supabase backend , in the backend supabase if vpn is connected and detected it should save in one table and if the vpn is not connected and not detceted then it should save in another table .. 
+in the dashboardpage.py .. it should create a pie chart of about total no.of times the application is runned and that gragh is segregated into 2 section the 2 section of the pie chart are vpn detected and vpn not detceted this should be in 2 different colurs (these total no.of times the vpn connected and the vpn not connected data should be fetched from the supabase backend) and below these there will be 2 section no.of times the vpn detected and no.of times the vpn not detected and inside these sections the details like the ip, location of ip,  isp , corrdinates should be present the same applies for both the sections , what are the values that are recorded in the public ip section of the mainpage.py( the same as the output of the vpn_dectetion.py) should be present in there ..in the vpn connected section if the dashboardpage.py it should fetch the data from the vpn connected and detceted table of the supabase backend and... in the vpn not connected table it should fetch the data from the vpn not connected and not detected table from the supabase backend ... 
+in the profilepage.py .. it should display the details that the users have entered at the time of login and there is a edit profile button if clicked on that then the users can change the details of them .. d  if the user decided change the account there is a logout button and if clicked on this link then the account is logged out once logged out the user will need to signing and then only he /she can open the application and start again .. and there is another button called as the delete button is the user clicks on the button then the account of the user is deleted even from the supabase .. 
+there must be footer (i have the code for it) that is placed at the bottom of every page ( except the login page - which is opened only at the start of the page) ..
+similarly i there must be  a navbar.py ( i have the codes for this also) this should be placed in the right side top corner below the header for which i ahve left the space .. through this navbar.py only the users can shift or change between pages .. 
+and in the left of the navbar.py there will a logo of the application that is present in all the 3 pages .. 
+the application is created not for full sized windows and created like only for a medium sized of the screen and cannot be made into full size .. 
+also i have 4 logos..
+1.company_logo.png- this should be displayed in the loginpage only 
+2.product_logo_transaparent_bg.png- this is the logo that is displayed in the 3 pages 
+3.Logo_png-this is should be displayed as the icon for build the .deb in linux
+4.Logo.ico - this should be displayed as the icon for building the windows application..
+
+when creating a structure the structure should include the buil directory in which all thee building of the application files will be placed .. when the application is built it should not have any starting trouble i.e when the application is built it should start imeedately after clicking on it and when closed it should close the application and should not open again .. also create me like when the application is run i a system that has no mudules or libraries or the dependeies it should run without any errors about the libraries please do it like that ..
+this is complete working of my application .. now below all this i will give the code for all the files 
+the work of u is to analyse the working which i have given to u above and create the structure for the above working requirments .
